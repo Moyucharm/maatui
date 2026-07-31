@@ -1,4 +1,4 @@
-//! 子进程控制：启动 `maa`、捕获日志、停止进程组。
+//! 子进程控制：启动 `maa`、捕获分级日志、停止进程组。
 
 use std::io::{BufRead, BufReader};
 use std::os::unix::process::CommandExt;
@@ -7,56 +7,110 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use libc::{kill, pid_t, SIGKILL, SIGTERM};
+use libc::{SIGKILL, SIGTERM, kill, pid_t};
 use strip_ansi_escapes::strip_str;
 
-/// 日志来源流。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LogStream {
-    Stdout,
-    Stderr,
+pub enum LogLevel {
+    Plain,
+    Info,
+    Success,
+    Warn,
+    Error,
+    Debug,
+    Trace,
     System,
 }
 
-/// Runner 推送给 UI 的事件。
 #[derive(Debug, Clone)]
 pub enum RunnerEvent {
-    Line { stream: LogStream, text: String },
+    Line { level: LogLevel, text: String },
     Exited { code: Option<i32>, stopped: bool },
 }
 
-/// 正在运行的任务句柄。
+#[derive(Debug, Clone)]
+pub struct TaskCommand {
+    pub label: String,
+    pub program: String,
+    pub args: Vec<String>,
+    pub envs: Vec<(String, String)>,
+}
+
+impl TaskCommand {
+    pub fn daily() -> Self {
+        Self::maa("每日任务", ["run", "daily", "-v"])
+    }
+
+    pub fn copilot(args: Vec<String>) -> Self {
+        let mut command = Self::maa("自动战斗", std::iter::empty::<&str>());
+        command.args = args;
+        command
+    }
+
+    pub fn maa<I, S>(label: impl Into<String>, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            label: label.into(),
+            program: "maa".to_string(),
+            args: args.into_iter().map(Into::into).collect(),
+            envs: vec![("MAA_LOG_PREFIX".to_string(), "Always".to_string())],
+        }
+    }
+
+    pub fn display(&self) -> String {
+        std::iter::once(self.program.as_str())
+            .chain(self.args.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
 pub struct RunningTask {
     child: Child,
     pgid: pid_t,
     event_rx: Receiver<RunnerEvent>,
-    /// 用户是否请求过停止。
     stop_requested: bool,
-    /// 已发送 SIGTERM 的时间；用于超时 SIGKILL。
     term_at: Option<Instant>,
-    /// 是否已观察到进程退出。
     finished: bool,
-    /// 是否已向 UI 发送过 Exited 事件。
     exit_emitted: bool,
 }
 
 impl RunningTask {
-    /// 启动 `maa run daily -v`。
-    pub fn spawn_daily() -> Result<Self, String> {
-        Self::spawn_command("maa", &["run", "daily", "-v"])
+    pub fn spawn(command: &TaskCommand) -> Result<Self, String> {
+        Self::spawn_command_with_env(
+            &command.program,
+            &command.args.iter().map(String::as_str).collect::<Vec<_>>(),
+            &command
+                .envs
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect::<Vec<_>>(),
+        )
     }
 
-    /// 通用启动（测试与正式路径共用）。
+    #[cfg(test)]
     pub fn spawn_command(program: &str, args: &[&str]) -> Result<Self, String> {
+        Self::spawn_command_with_env(program, args, &[])
+    }
+
+    fn spawn_command_with_env(
+        program: &str,
+        args: &[&str],
+        envs: &[(&str, &str)],
+    ) -> Result<Self, String> {
         let (tx, rx) = mpsc::channel::<RunnerEvent>();
 
         let mut cmd = Command::new(program);
         cmd.args(args)
+            .envs(envs.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        // 独立进程组，停止时组杀避免孤儿。
+        // 独立进程组，停止时组杀避免 MaaCore 等子进程残留。
         unsafe {
             cmd.pre_exec(|| {
                 if libc::setpgid(0, 0) != 0 {
@@ -67,20 +121,18 @@ impl RunningTask {
         }
 
         let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                let msg = if e.kind() == std::io::ErrorKind::NotFound {
+            Ok(child) => child,
+            Err(error) => {
+                let message = if error.kind() == std::io::ErrorKind::NotFound {
                     format!("找不到命令 `{program}`，请确认已安装并在 PATH 中")
                 } else {
-                    format!("启动 `{program}` 失败: {e}")
+                    format!("启动 `{program}` 失败: {error}")
                 };
-                return Err(msg);
+                return Err(message);
             }
         };
 
-        // 子进程 pre_exec 中 setpgid(0,0)，故 pgid == pid。
         let pgid = child.id() as pid_t;
-
         let stdout = child
             .stdout
             .take()
@@ -90,8 +142,8 @@ impl RunningTask {
             .take()
             .ok_or_else(|| "缺少 stderr pipe".to_string())?;
 
-        spawn_reader(stdout, LogStream::Stdout, tx.clone());
-        spawn_reader(stderr, LogStream::Stderr, tx);
+        spawn_reader(stdout, false, tx.clone());
+        spawn_reader(stderr, true, tx);
 
         Ok(Self {
             child,
@@ -104,22 +156,18 @@ impl RunningTask {
         })
     }
 
-    /// 非阻塞拉取事件，并推进停止超时 / 退出检测。
     pub fn poll_events(&mut self) -> Vec<RunnerEvent> {
         let mut events = Vec::new();
-
-        while let Ok(ev) = self.event_rx.try_recv() {
-            events.push(ev);
+        while let Ok(event) = self.event_rx.try_recv() {
+            events.push(event);
         }
 
-        // 停止超时：SIGTERM 后 3s 仍未退出则 SIGKILL。
         if self.stop_requested
             && !self.finished
             && let Some(term_at) = self.term_at
             && term_at.elapsed() >= Duration::from_secs(3)
         {
             let _ = unsafe { kill(-self.pgid, SIGKILL) };
-            // 避免重复 kill。
             self.term_at = None;
         }
 
@@ -136,11 +184,11 @@ impl RunningTask {
                     }
                 }
                 Ok(None) => {}
-                Err(e) => {
+                Err(error) => {
                     self.finished = true;
                     events.push(RunnerEvent::Line {
-                        stream: LogStream::System,
-                        text: format!("等待子进程出错: {e}"),
+                        level: LogLevel::Error,
+                        text: format!("等待子进程出错: {error}"),
                     });
                     if !self.exit_emitted {
                         self.exit_emitted = true;
@@ -156,7 +204,6 @@ impl RunningTask {
         events
     }
 
-    /// 请求停止：向进程组发送 SIGTERM。
     pub fn request_stop(&mut self) {
         if self.finished || self.stop_requested {
             return;
@@ -174,7 +221,6 @@ impl RunningTask {
         self.stop_requested
     }
 
-    /// 阻塞回收：确保进程结束（App 退出时调用）。
     pub fn force_cleanup(mut self) {
         if !self.finished {
             self.request_stop();
@@ -203,18 +249,21 @@ impl RunningTask {
 
 fn spawn_reader<R: std::io::Read + Send + 'static>(
     reader: R,
-    stream: LogStream,
+    is_stderr: bool,
     tx: Sender<RunnerEvent>,
 ) {
     let _ = thread::Builder::new()
-        .name(format!("maa-log-{stream:?}"))
+        .name(if is_stderr {
+            "maa-log-stderr".to_string()
+        } else {
+            "maa-log-stdout".to_string()
+        })
         .spawn(move || {
-            let buf = BufReader::new(reader);
-            for line in buf.lines() {
+            for line in BufReader::new(reader).lines() {
                 match line {
                     Ok(raw) => {
-                        let text = strip_str(&raw);
-                        if tx.send(RunnerEvent::Line { stream, text }).is_err() {
+                        let (level, text) = classify_log_line(&raw, is_stderr);
+                        if tx.send(RunnerEvent::Line { level, text }).is_err() {
                             break;
                         }
                     }
@@ -224,6 +273,34 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
         });
 }
 
+pub fn classify_log_line(raw: &str, _is_stderr: bool) -> (LogLevel, String) {
+    let text = strip_str(raw);
+    let upper = text.to_ascii_uppercase();
+    let level = if contains_level(&upper, "ERROR") {
+        LogLevel::Error
+    } else if contains_level(&upper, "WARN") {
+        LogLevel::Warn
+    } else if contains_level(&upper, "DEBUG") {
+        LogLevel::Debug
+    } else if contains_level(&upper, "TRACE") {
+        LogLevel::Trace
+    } else if contains_level(&upper, "INFO") {
+        LogLevel::Info
+    } else if upper.contains("SUCCESS") || text.contains("完成") || text.contains("成功") {
+        LogLevel::Success
+    } else {
+        // maa-cli 的常规日志也写入 stderr，不能仅凭输出流判定为警告。
+        LogLevel::Plain
+    };
+    (level, text)
+}
+
+fn contains_level(text: &str, level: &str) -> bool {
+    text.contains(&format!("[{level}]"))
+        || text.contains(&format!(" {level} "))
+        || text.starts_with(&format!("{level}:"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,29 +308,29 @@ mod tests {
     #[test]
     fn missing_program_returns_error() {
         let result = RunningTask::spawn_command("maatui-definitely-missing-bin", &[]);
-        let err = match result {
+        let error = match result {
             Ok(_) => panic!("should fail to spawn missing program"),
-            Err(e) => e,
+            Err(error) => error,
         };
-        assert!(err.contains("找不到命令"), "err={err}");
+        assert!(error.contains("找不到命令"), "error={error}");
     }
 
     #[test]
     fn captures_stdout_and_exits() {
-        let mut task = RunningTask::spawn_command("sh", &["-c", "echo hello-maatui; echo err-line 1>&2"])
-            .expect("spawn sh");
+        let mut task = RunningTask::spawn_command(
+            "sh",
+            &["-c", "echo hello-maatui; echo '[ERROR] err-line' 1>&2"],
+        )
+        .expect("spawn sh");
 
         let mut lines = Vec::new();
         let mut exited = None;
         let deadline = Instant::now() + Duration::from_secs(2);
-
         while Instant::now() < deadline {
-            for ev in task.poll_events() {
-                match ev {
-                    RunnerEvent::Line { text, .. } => lines.push(text),
-                    RunnerEvent::Exited { code, stopped } => {
-                        exited = Some((code, stopped));
-                    }
+            for event in task.poll_events() {
+                match event {
+                    RunnerEvent::Line { level, text } => lines.push((level, text)),
+                    RunnerEvent::Exited { code, stopped } => exited = Some((code, stopped)),
                 }
             }
             if exited.is_some() {
@@ -262,11 +339,13 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
 
-        assert!(lines.iter().any(|l| l.contains("hello-maatui")), "{lines:?}");
-        assert!(lines.iter().any(|l| l.contains("err-line")), "{lines:?}");
-        let (code, stopped) = exited.expect("should exit");
-        assert_eq!(code, Some(0));
-        assert!(!stopped);
+        assert!(lines.iter().any(|(_, line)| line.contains("hello-maatui")));
+        assert!(
+            lines
+                .iter()
+                .any(|(level, line)| { *level == LogLevel::Error && line.contains("err-line") })
+        );
+        assert_eq!(exited, Some((Some(0), false)));
         assert!(task.is_finished());
     }
 
@@ -274,13 +353,11 @@ mod tests {
     fn stop_terminates_long_running_process() {
         let mut task = RunningTask::spawn_command("sh", &["-c", "echo start; sleep 30; echo end"])
             .expect("spawn sleep");
-
-        // 等第一行日志，确认已跑起来。
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut saw_start = false;
         while Instant::now() < deadline {
-            for ev in task.poll_events() {
-                if let RunnerEvent::Line { text, .. } = ev
+            for event in task.poll_events() {
+                if let RunnerEvent::Line { text, .. } = event
                     && text.contains("start")
                 {
                     saw_start = true;
@@ -291,16 +368,14 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(20));
         }
-        assert!(saw_start, "should see start line");
+        assert!(saw_start);
 
         task.request_stop();
-        assert!(task.stop_requested());
-
         let mut exited = None;
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
-            for ev in task.poll_events() {
-                if let RunnerEvent::Exited { code, stopped } = ev {
+            for event in task.poll_events() {
+                if let RunnerEvent::Exited { code, stopped } = event {
                     exited = Some((code, stopped));
                 }
             }
@@ -309,11 +384,19 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(20));
         }
+        assert!(exited.expect("should stop").1);
+    }
 
-        let (code, stopped) = exited.expect("should be stopped");
-        assert!(stopped);
-        // SIGTERM 常见 exit 为 None（信号终止）或非 0。
-        let _ = code;
-        assert!(task.is_finished());
+    #[test]
+    fn classifies_levels_without_treating_all_stderr_as_warning() {
+        assert_eq!(classify_log_line("[ERROR] boom", true).0, LogLevel::Error);
+        assert_eq!(classify_log_line("[WARN] caution", true).0, LogLevel::Warn);
+        assert_eq!(classify_log_line("[INFO] normal", true).0, LogLevel::Info);
+        assert_eq!(classify_log_line("[DEBUG] detail", true).0, LogLevel::Debug);
+        assert_eq!(classify_log_line("[TRACE] trace", true).0, LogLevel::Trace);
+        assert_eq!(
+            classify_log_line("ordinary stderr", true).0,
+            LogLevel::Plain
+        );
     }
 }

@@ -1,7 +1,9 @@
 //! MaaTUI — 本地 maa 的轻量 TUI 控制壳。
 
 mod app;
+mod config;
 mod runner;
+mod stage;
 mod ui;
 
 use std::io::{self, stdout};
@@ -9,15 +11,13 @@ use std::panic;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind,
-};
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 
 use app::{App, TaskPhase};
 

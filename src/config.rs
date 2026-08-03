@@ -1,13 +1,13 @@
 //! maa-cli `daily` 配置的定位、无损编辑与原子保存。
 
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, value};
+
+use crate::storage::{atomic_write, maa_config_dir};
 
 const DAILY_EXTENSIONS: [&str; 4] = ["toml", "yaml", "yml", "json"];
 
@@ -654,27 +654,7 @@ impl DailyConfig {
             _ => bail!("配置格式与数据不匹配"),
         };
 
-        let save_path = if fs::symlink_metadata(&self.path)?.file_type().is_symlink() {
-            fs::canonicalize(&self.path)
-                .with_context(|| format!("解析配置链接失败: {}", self.path.display()))?
-        } else {
-            self.path.clone()
-        };
-        let permissions = fs::metadata(&save_path)?.permissions();
-        let (temp_path, mut temp) = create_temp_file(&save_path)?;
-        let write_result = (|| -> Result<()> {
-            fs::set_permissions(&temp_path, permissions)?;
-            temp.write_all(content.as_bytes())?;
-            temp.sync_all()?;
-            drop(temp);
-            fs::rename(&temp_path, &save_path)
-                .with_context(|| format!("替换配置失败: {}", save_path.display()))?;
-            Ok(())
-        })();
-        if write_result.is_err() {
-            let _ = fs::remove_file(&temp_path);
-        }
-        write_result
+        atomic_write(&self.path, content.as_bytes())
     }
 
     fn mutate_and_save<T>(
@@ -719,36 +699,6 @@ impl DailyConfig {
         }
         Ok(())
     }
-}
-
-fn create_temp_file(path: &Path) -> Result<(PathBuf, File)> {
-    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("配置文件名无效")?;
-    for _ in 0..100 {
-        let sequence = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let temp_path = path.with_file_name(format!(
-            ".{file_name}.maatui.{}.{}.tmp",
-            std::process::id(),
-            sequence
-        ));
-        match OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temp_path)
-        {
-            Ok(file) => return Ok((temp_path, file)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("创建临时配置失败: {}", temp_path.display()));
-            }
-        }
-    }
-    bail!("无法创建唯一的临时配置文件")
 }
 
 fn validate_toml_task(task: &Table, index: usize) -> Result<()> {
@@ -833,14 +783,6 @@ fn validate_json_variant(
         }
     }
     Ok(())
-}
-
-fn maa_config_dir() -> Result<PathBuf> {
-    if let Some(dir) = std::env::var_os("MAA_CONFIG_DIR") {
-        return Ok(PathBuf::from(dir));
-    }
-    let home = std::env::var_os("HOME").context("无法确定 HOME，且未设置 MAA_CONFIG_DIR")?;
-    Ok(PathBuf::from(home).join(".config/maa"))
 }
 
 fn default_task_name(task_type: &str) -> &'static str {

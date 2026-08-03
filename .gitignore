@@ -1,5 +1,6 @@
 /target/
 /debug/
 /.agents/
+/.agent/
 **/*.rs.bk
 .DS_Store

@@ -5,10 +5,11 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
-    App, EditorSection, MainMenuItem, Screen, SelectDialog, TASK_TYPES, TaskPhase, variant_fields,
+    App, CopilotDetailDialog, CopilotSection, EditorSection, MainMenuItem, Screen, SelectDialog,
+    TASK_TYPES, TaskPhase, variant_fields,
 };
 use crate::runner::LogLevel;
 
@@ -18,20 +19,30 @@ const OK: Color = Color::Green;
 const WARN: Color = Color::Yellow;
 const ERR: Color = Color::Red;
 
+// 日志使用固定 RGB，避免终端主题把 ANSI 青色重映射成黄色。
+const LOG_TEXT: Color = Color::Rgb(205, 214, 244);
+const LOG_INFO: Color = Color::Rgb(137, 220, 235);
+const LOG_SUCCESS: Color = Color::Rgb(166, 227, 161);
+const LOG_WARN: Color = Color::Rgb(249, 226, 175);
+const LOG_ERROR: Color = Color::Rgb(243, 139, 168);
+const LOG_DEBUG: Color = Color::Rgb(147, 153, 178);
+const LOG_TRACE: Color = Color::Rgb(108, 112, 134);
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    let show_logs =
-        app.phase != TaskPhase::Idle || matches!(app.screen, Screen::Daily | Screen::Copilot);
+    let show_logs = app.phase != TaskPhase::Idle
+        || matches!(app.screen, Screen::Daily | Screen::Copilot | Screen::Update);
     let chunks = if show_logs {
+        let form_constraint = if app.phase == TaskPhase::Idle {
+            Constraint::Length(form_content_height(app, area.height))
+        } else {
+            Constraint::Length(4)
+        };
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3),
-                if app.phase == TaskPhase::Idle {
-                    Constraint::Min(8)
-                } else {
-                    Constraint::Length(4)
-                },
+                form_constraint,
                 Constraint::Min(8),
                 Constraint::Length(1),
             ])
@@ -68,6 +79,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if let Some(confirm) = &app.confirm {
         draw_confirm_dialog(frame, area, &confirm.message);
+    }
+    if let Some(detail) = app.copilot_detail.as_mut() {
+        draw_copilot_detail(frame, area, detail);
     }
 }
 
@@ -113,6 +127,7 @@ fn draw_screen(frame: &mut Frame, app: &App, area: Rect) {
         Screen::VariantList => draw_variant_list(frame, app, area),
         Screen::VariantEdit => draw_variant_edit(frame, app, area),
         Screen::Copilot => draw_copilot(frame, app, area),
+        Screen::Update => draw_update(frame, app, area),
     }
 }
 
@@ -263,9 +278,12 @@ fn draw_task_edit(frame: &mut Frame, app: &App, area: Rect) {
             let selected = index == app.field_idx;
             let value = app
                 .task_field_value(field)
-                .unwrap_or_else(|| field.default.clone())
-                .display();
-            field_item(selected, field.label, &value)
+                .unwrap_or_else(|| field.default.clone());
+            field_item(
+                selected,
+                field.label,
+                &app.task_field_display(field, &value),
+            )
         })
         .collect();
     render_list(
@@ -324,9 +342,12 @@ fn draw_variant_edit(frame: &mut Frame, app: &App, area: Rect) {
             let selected = index == app.field_idx;
             let value = app
                 .variant_field_value(field)
-                .unwrap_or_else(|| field.default.clone())
-                .display();
-            field_item(selected, field.label, &value)
+                .unwrap_or_else(|| field.default.clone());
+            field_item(
+                selected,
+                field.label,
+                &app.variant_field_display(field, &value),
+            )
         })
         .collect();
     render_list(
@@ -339,17 +360,172 @@ fn draw_variant_edit(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_copilot(frame: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .split(area);
+    let tabs = Line::from(
+        CopilotSection::ALL
+            .iter()
+            .enumerate()
+            .flat_map(|(index, section)| {
+                let selected = index == app.copilot_section_idx;
+                [
+                    Span::raw("  "),
+                    Span::styled(
+                        section.label(),
+                        if selected {
+                            Style::default()
+                                .fg(ACCENT)
+                                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                        } else {
+                            Style::default().fg(MUTED)
+                        },
+                    ),
+                ]
+            })
+            .collect::<Vec<_>>(),
+    );
+    frame.render_widget(Paragraph::new(tabs).block(panel(" 自动战斗 ")), chunks[0]);
+
+    match app.copilot_section() {
+        CopilotSection::Singles => draw_single_copilot(frame, app, chunks[1]),
+        CopilotSection::Sets => draw_copilot_list(frame, app, chunks[1]),
+        CopilotSection::Settings => draw_copilot_settings(frame, app, chunks[1]),
+    }
+}
+
+fn draw_single_copilot(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(cache) = &app.copilot_cache else {
+        frame.render_widget(
+            Paragraph::new("\n  × 作业缓存未加载")
+                .style(Style::default().fg(ERR))
+                .block(panel(" 当前单作业 ")),
+            area,
+        );
+        return;
+    };
+    let lines = if let Some(entry) = cache.current_single() {
+        let supported = app
+            .current_single_supported_modes
+            .map(|(normal, raid)| match (normal, raid) {
+                (true, true) => "普通 / 突袭",
+                (false, true) => "突袭",
+                _ => "普通",
+            })
+            .unwrap_or("未知");
+        let current = if entry.is_raid { "突袭" } else { "普通" };
+        vec![
+            Line::from(vec![
+                Span::styled("  当前作业  ", Style::default().fg(MUTED)),
+                Span::styled(entry.display_name(), Style::default().fg(Color::White)),
+            ]),
+            Line::from(format!("  关卡      {}", entry.stage_name)),
+            Line::from(format!("  支持模式  {supported}")),
+            Line::from(format!("  运行模式  {current}")),
+            Line::from(format!("  来源      {}", entry.source_label())),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  运行前请手动打开对应准备界面；双模式作业可按 Space 切换运行模式。",
+                Style::default().fg(WARN),
+            )),
+        ]
+    } else {
+        vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  尚未选择当前单作业",
+                Style::default().fg(WARN),
+            )),
+            Line::from(Span::styled(
+                "  按 e 搜索作业；编辑框内 Ctrl+U 可快速清空。",
+                Style::default().fg(MUTED),
+            )),
+        ]
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(panel(" 当前单作业 · 替换而非保留历史列表 ")),
+        area,
+    );
+}
+
+fn draw_copilot_list(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(cache) = &app.copilot_cache else {
+        let message = app.copilot_error.as_deref().unwrap_or("作业列表未加载");
+        frame.render_widget(
+            Paragraph::new(format!("\n  × {message}"))
+                .style(Style::default().fg(ERR))
+                .block(panel(" 作业列表 ")),
+            area,
+        );
+        return;
+    };
+
+    let indices = app.copilot_visible_indices();
+    let items: Vec<ListItem> = if indices.is_empty() {
+        let (empty, hint) = ("暂无批量作业条目", "按 a 添加作业集或单个作业");
+        vec![ListItem::new(Line::from(vec![
+            Span::styled(format!("  {empty}"), Style::default().fg(WARN)),
+            Span::styled(format!(" · {hint}"), Style::default().fg(MUTED)),
+        ]))]
+    } else {
+        indices
+            .iter()
+            .enumerate()
+            .filter_map(|(visible_index, &index)| {
+                let entry = cache.entry(index)?;
+                let selected = visible_index == app.copilot_idx;
+                let style = if selected {
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                let enabled = if entry.enabled { "[开]" } else { "[关]" };
+                let enabled_color = if entry.enabled { OK } else { MUTED };
+                let difficulty = if entry.is_raid { "突袭" } else { "普通" };
+                let difficulty_color = if entry.is_raid { WARN } else { LOG_INFO };
+                let source = format!("{}  {}", entry.origin.label(), entry.source_label());
+                Some(ListItem::new(Line::from(vec![
+                    Span::styled(if selected { "▶ " } else { "  " }, style),
+                    Span::styled(format!("{enabled:<5}"), Style::default().fg(enabled_color)),
+                    Span::styled(
+                        format!("{difficulty:<6}"),
+                        Style::default().fg(difficulty_color),
+                    ),
+                    Span::styled(pad_display_width(&entry.stage_name, 12), style),
+                    Span::styled(entry.display_name(), style),
+                    Span::styled(format!("  {source}"), Style::default().fg(MUTED)),
+                ])))
+            })
+            .collect()
+    };
+    let import = app
+        .copilot_import_progress
+        .as_ref()
+        .map(|progress| {
+            format!(
+                " · 导入 {}/{} {}",
+                progress.completed, progress.total, progress.label
+            )
+        })
+        .unwrap_or_default();
+    let title = format!(
+        " 作业集列表 · 已启用 {}/{}{} ",
+        cache.enabled_count(),
+        indices.len(),
+        import
+    );
+    render_list(frame, area, &title, items, app.copilot_idx);
+}
+
+fn draw_copilot_settings(frame: &mut Frame, app: &App, area: Rect) {
     let rows = [
         (
-            "作业来源",
-            if app.copilot.source.is_empty() {
-                "<请输入>".to_string()
-            } else {
-                app.copilot.source.clone()
-            },
+            "自动编队",
+            format!("{} · 批量模式强制开启", on_off(app.copilot.formation)),
         ),
-        ("模式", app.copilot.raid.label().to_string()),
-        ("自动编队", on_off(app.copilot.formation)),
         (
             "编队编号",
             if app.copilot.formation_index == 0 {
@@ -373,26 +549,60 @@ fn draw_copilot(frame: &mut Frame, app: &App, area: Rect) {
                 app.copilot.support_unit_name.clone()
             },
         ),
-        ("循环次数", app.copilot.loop_times.to_string()),
-        ("开始运行", "maa copilot ... -v".to_string()),
+        ("循环次数", format!("{} · 仅单作业", app.copilot.loop_times)),
     ];
     let items = rows
         .iter()
         .enumerate()
-        .map(|(index, (label, value))| field_item(index == app.copilot_idx, label, value))
+        .map(|(index, (label, value))| field_item(index == app.copilot_settings_idx, label, value))
         .collect();
     render_list(
         frame,
         area,
-        " 自动战斗 · 支持数字 / maa:// / prts:// / 本地 JSON ",
+        " 共享运行设置 · Enter 编辑 ",
         items,
-        app.copilot_idx,
+        app.copilot_settings_idx,
+    );
+}
+
+fn draw_update(frame: &mut Frame, app: &App, area: Rect) {
+    let rows = [
+        (
+            "更新热更新资源",
+            "maa hot-update --batch -v · 不更新 Core".to_string(),
+        ),
+        (
+            "更新 Core + 基础资源",
+            "maa update --batch -v · 使用已配置频道".to_string(),
+        ),
+    ];
+    let items = rows
+        .iter()
+        .enumerate()
+        .map(|(index, (label, value))| field_item(index == app.update_idx, label, value))
+        .collect();
+    render_list(
+        frame,
+        area,
+        " 更新管理 · Enter 后确认执行 ",
+        items,
+        app.update_idx,
     );
 }
 
 fn draw_running_control(frame: &mut Frame, app: &App, area: Rect) {
     let label = match app.phase {
-        TaskPhase::Running => format!("{}  {} 运行中", app.spinner(), app.active_label),
+        TaskPhase::Running => {
+            if let Some((current, total, name)) = app.copilot_batch_progress() {
+                format!(
+                    "{}  {}  [{current}/{total}] {name}",
+                    app.spinner(),
+                    app.active_label
+                )
+            } else {
+                format!("{}  {} 运行中", app.spinner(), app.active_label)
+            }
+        }
         TaskPhase::Stopping => format!("{}停止中…", app.active_label),
         TaskPhase::Idle => String::new(),
     };
@@ -401,16 +611,22 @@ fn draw_running_control(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         OK
     };
+    let stop = "[ Enter / s ] 停止任务";
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let progress_width = inner_width.saturating_sub(stop.width());
+    let progress = if progress_width > 2 {
+        let content = truncate_display_width(&label, progress_width - 2);
+        pad_display_width(&format!("  {content}"), progress_width)
+    } else {
+        " ".repeat(progress_width)
+    };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                format!("  {label:<32}"),
+                progress,
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                "[ Enter / s ] 停止任务",
-                Style::default().fg(ERR).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(stop, Style::default().fg(ERR).add_modifier(Modifier::BOLD)),
         ]))
         .block(
             Block::default()
@@ -448,13 +664,15 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
         .logs
         .iter()
         .map(|log| {
-            let (prefix, color) = log_style(log.level);
+            let (prefix, level_color, text_color) = log_style(log.level);
             Line::from(vec![
                 Span::styled(
                     format!("{prefix} "),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(level_color)
+                        .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(log.text.clone(), Style::default().fg(color)),
+                Span::styled(log.text.clone(), Style::default().fg(text_color)),
             ])
         })
         .collect();
@@ -480,7 +698,18 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             Screen::TaskEdit => "←→/hl 切换层级  ↑↓ 选择  Enter/e 编辑  v 创建活动变体  Esc 返回",
             Screen::VariantList => "a 新增  d 删除  Shift+↑↓ 移动  Enter 编辑  Esc 返回",
             Screen::VariantEdit => "↑↓ 选择  Enter 编辑  Esc 返回",
-            Screen::Copilot => "↑↓ 选择  Enter/e 编辑或切换  r 运行  Esc 返回",
+            Screen::Copilot => match app.copilot_section() {
+                CopilotSection::Singles => {
+                    "e/a 搜索或替换  Space 切换双模式难度  i 查看详情  Enter 运行  Tab 切页签"
+                }
+                CopilotSection::Sets => {
+                    "↑↓ 选择  Space 启停  a 添加（←→切换类型）  t 全部启停  c 清空  i 详情  d 删除  Shift+↑↓ 移动  Enter 单独运行  r 批量运行  Tab 切页签"
+                }
+                CopilotSection::Settings => {
+                    "↑↓ 选择  Enter/e 编辑  r 批量运行  Tab/←→ 作业页签  Esc 返回"
+                }
+            },
+            Screen::Update => "↑↓/jk 选择  Enter 更新  Esc 返回",
         }
     };
     frame.render_widget(
@@ -509,7 +738,7 @@ fn draw_input_dialog(frame: &mut Frame, area: Rect, title: &str, value: &str) {
                 Span::styled("█", Style::default().fg(ACCENT)),
             ]),
             Line::from(Span::styled(
-                "  Enter 确认 · Esc 取消",
+                "  Enter 确认 · Esc 取消 · Ctrl+U 清空 · 批量添加时 ←/→ 切换类型",
                 Style::default().fg(MUTED),
             )),
         ])
@@ -602,6 +831,37 @@ fn draw_select_dialog(frame: &mut Frame, area: Rect, select: &SelectDialog) {
     );
 }
 
+fn draw_copilot_detail(frame: &mut Frame, area: Rect, detail: &mut CopilotDetailDialog) {
+    let height = area.height.saturating_sub(4).clamp(10, 30);
+    let popup = centered_rect(92, height, area);
+    frame.render_widget(Clear, popup);
+    let title = format!(" {} ", detail.title);
+    let block = panel(&title).title_bottom(Line::from(Span::styled(
+        " Esc/q 关闭 · ↑↓/jk 滚动 · PgUp/PgDn 快速滚动 ",
+        Style::default().fg(MUTED),
+    )));
+    let inner = block.inner(popup);
+    let popup_width = inner.width.max(1);
+    let content_rows = detail
+        .lines
+        .iter()
+        .map(|line| {
+            let width = line.width() as u16;
+            width.max(1).div_ceil(popup_width)
+        })
+        .sum::<u16>();
+    let max_scroll = content_rows.saturating_sub(inner.height);
+    detail.scroll = detail.scroll.min(max_scroll);
+    frame.render_widget(block, popup);
+    frame.render_widget(
+        Paragraph::new(detail.lines.join("\n"))
+            .style(Style::default().fg(Color::White))
+            .wrap(Wrap { trim: false })
+            .scroll((detail.scroll, 0)),
+        inner,
+    );
+}
+
 fn draw_confirm_dialog(frame: &mut Frame, area: Rect, message: &str) {
     let popup = centered_rect(64, 7, area);
     frame.render_widget(Clear, popup);
@@ -652,6 +912,28 @@ fn field_item(selected: bool, label: &str, value: &str) -> ListItem<'static> {
     ]))
 }
 
+fn truncate_display_width(text: &str, max_width: usize) -> String {
+    if text.width() <= max_width {
+        return text.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    let target = max_width.saturating_sub(1);
+    let mut result = String::new();
+    let mut width = 0;
+    for character in text.chars() {
+        let character_width = character.width().unwrap_or(0);
+        if width + character_width > target {
+            break;
+        }
+        result.push(character);
+        width += character_width;
+    }
+    result.push('…');
+    result
+}
+
 fn pad_display_width(text: &str, width: usize) -> String {
     let padding = width.saturating_sub(text.width());
     format!("{text}{}", " ".repeat(padding))
@@ -664,16 +946,47 @@ fn panel<'a>(title: &'a str) -> Block<'a> {
         .title(Span::styled(title, Style::default().fg(ACCENT)))
 }
 
-fn log_style(level: LogLevel) -> (&'static str, Color) {
+/// Idle + 日志页的表单高度：内容行 + 上下边框，并给日志至少留 8 行。
+fn form_content_height(app: &App, total_height: u16) -> u16 {
+    const HEADER: u16 = 3;
+    const FOOTER: u16 = 1;
+    const LOGS_MIN: u16 = 8;
+    const FORM_MIN: u16 = 4;
+    const BORDER: u16 = 2;
+
+    let rows = match app.screen {
+        Screen::Copilot => match app.copilot_section() {
+            CopilotSection::Singles => 8,
+            CopilotSection::Sets => app.copilot_visible_indices().len().max(1) as u16 + 3,
+            CopilotSection::Settings => 11,
+        },
+        Screen::Daily | Screen::Update => 2,
+        Screen::Main => MainMenuItem::ALL.len() as u16,
+        Screen::AddTask => TASK_TYPES.len() as u16,
+        Screen::Config => app
+            .config
+            .as_ref()
+            .map(|config| config.len().max(1) as u16)
+            .unwrap_or(1),
+        Screen::TaskEdit | Screen::VariantEdit => 6,
+        Screen::VariantList => 4,
+    };
+    let desired = rows.saturating_add(BORDER).max(FORM_MIN);
+    let reserved = HEADER.saturating_add(FOOTER).saturating_add(LOGS_MIN);
+    let available = total_height.saturating_sub(reserved).max(FORM_MIN);
+    desired.min(available)
+}
+
+fn log_style(level: LogLevel) -> (&'static str, Color, Color) {
     match level {
-        LogLevel::Plain => ("│", Color::White),
-        LogLevel::Info => ("i", ACCENT),
-        LogLevel::Success => ("✓", OK),
-        LogLevel::Warn => ("!", WARN),
-        LogLevel::Error => ("×", ERR),
-        LogLevel::Debug => ("·", Color::Gray),
-        LogLevel::Trace => ("·", MUTED),
-        LogLevel::System => ("◆", ACCENT),
+        LogLevel::Plain => ("│", LOG_TRACE, LOG_TEXT),
+        LogLevel::Info => ("i", LOG_INFO, LOG_TEXT),
+        LogLevel::Success => ("✓", LOG_SUCCESS, LOG_TEXT),
+        LogLevel::Warn => ("!", LOG_WARN, LOG_WARN),
+        LogLevel::Error => ("×", LOG_ERROR, LOG_ERROR),
+        LogLevel::Debug => ("·", LOG_DEBUG, LOG_DEBUG),
+        LogLevel::Trace => ("·", LOG_TRACE, LOG_TRACE),
+        LogLevel::System => ("◆", LOG_INFO, LOG_TEXT),
     }
 }
 
@@ -708,4 +1021,50 @@ fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(vertical[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn info_log_uses_cyan_marker_and_neutral_text() {
+        let (prefix, level_color, text_color) = log_style(LogLevel::Info);
+
+        assert_eq!(prefix, "i");
+        assert_eq!(level_color, LOG_INFO);
+        assert_eq!(text_color, LOG_TEXT);
+        assert_ne!(level_color, text_color);
+    }
+
+    #[test]
+    fn warning_and_error_logs_keep_semantic_colors() {
+        assert_eq!(log_style(LogLevel::Warn), ("!", LOG_WARN, LOG_WARN));
+        assert_eq!(log_style(LogLevel::Error), ("×", LOG_ERROR, LOG_ERROR));
+    }
+
+    #[test]
+    fn truncates_mixed_width_text_without_exceeding_limit() {
+        assert_eq!(truncate_display_width("TO-1 作业详情", 8), "TO-1 作…");
+        assert_eq!(truncate_display_width("short", 8), "short");
+        assert_eq!(truncate_display_width("内容", 1), "…");
+        assert!(truncate_display_width("长标题abcdef", 7).width() <= 7);
+    }
+
+    #[test]
+    fn idle_copilot_form_fits_content_and_leaves_logs_room() {
+        let mut app = App::new();
+        app.copilot_cache = None;
+        app.screen = Screen::Copilot;
+        // 单作业卡片为固定高度。
+        assert_eq!(form_content_height(&app, 40), 10);
+        app.copilot_section_idx = 1;
+        assert_eq!(form_content_height(&app, 40), 6);
+        app.copilot_section_idx = 2;
+        assert_eq!(form_content_height(&app, 40), 13);
+        // 矮终端时优先保住日志 Min(8)
+        assert_eq!(form_content_height(&app, 20), 8);
+        app.screen = Screen::Update;
+        assert_eq!(form_content_height(&app, 40), 4);
+    }
 }

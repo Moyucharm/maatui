@@ -4,10 +4,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
+
+use crate::storage::maa_config_dir;
 
 const STAGE_ACTIVITY_URLS: [&str; 2] = [
     "https://api.maa.plus/MaaAssistantArknights/api/gui/StageActivityV2.json",
@@ -17,6 +19,7 @@ const TASKS_URLS: [&str; 2] = [
     "https://api.maa.plus/MaaAssistantArknights/api/resource/tasks.json",
     "https://ota.maa.plus/MaaAssistantArknights/api/resource/tasks.json",
 ];
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct StageEntry {
@@ -43,7 +46,9 @@ pub enum StageRefreshEvent {
 
 impl StageCatalog {
     pub fn load_cached() -> Self {
-        let path = cache_paths().0;
+        let Ok((path, _)) = cache_paths() else {
+            return Self::default();
+        };
         let Ok(raw) = fs::read_to_string(path) else {
             return Self::default();
         };
@@ -198,19 +203,29 @@ impl Availability {
 }
 
 fn refresh_catalog() -> Result<(StageCatalog, bool)> {
-    let (stage_path, tasks_path) = cache_paths();
-    let stage_json = fetch_json(&STAGE_ACTIVITY_URLS, &stage_path)?;
-    let tasks_updated = fetch_json(&TASKS_URLS, &tasks_path).is_ok();
+    let (stage_path, tasks_path) = cache_paths()?;
+    let agent = http_agent();
+    let stage_json = fetch_json(&agent, &STAGE_ACTIVITY_URLS, &stage_path)?;
+    let tasks_updated = fetch_json(&agent, &TASKS_URLS, &tasks_path).is_ok();
     Ok((StageCatalog::from_json(&stage_json), tasks_updated))
 }
 
-fn fetch_json(urls: &[&str], cache_path: &Path) -> Result<Value> {
+fn http_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(REQUEST_TIMEOUT)
+        .timeout_write(Duration::from_secs(10))
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+}
+
+fn fetch_json(agent: &ureq::Agent, urls: &[&str], cache_path: &Path) -> Result<Value> {
     let etag_path = PathBuf::from(format!("{}.etag", cache_path.display()));
     let etag = fs::read_to_string(&etag_path).unwrap_or_default();
     let mut errors = Vec::new();
 
     for url in urls {
-        let mut request = ureq::get(url).set("User-Agent", "MaaTUI/0.1");
+        let mut request = agent.get(url).set("User-Agent", "MaaTUI/0.1");
         if !etag.trim().is_empty() {
             request = request.set("If-None-Match", etag.trim());
         }
@@ -254,15 +269,12 @@ fn read_cached_json(path: &Path) -> Result<Value> {
     serde_json::from_str(&raw).with_context(|| format!("解析热更新缓存失败: {}", path.display()))
 }
 
-fn cache_paths() -> (PathBuf, PathBuf) {
-    let root = std::env::var_os("MAA_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/maa")))
-        .unwrap_or_else(|| PathBuf::from(".config/maa"));
-    (
+fn cache_paths() -> Result<(PathBuf, PathBuf)> {
+    let root = maa_config_dir()?;
+    Ok((
         root.join("cache/gui/StageActivityV2.json"),
         root.join("cache/resource/tasks.json"),
-    )
+    ))
 }
 
 fn availability(start: Option<i64>, expire: Option<i64>, now: i64) -> Availability {

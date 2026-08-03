@@ -1,18 +1,29 @@
 //! 应用状态、分层菜单、配置编辑与任务状态迁移。
 
 use std::collections::{HashSet, VecDeque};
-use std::path::Path;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
+use std::thread;
 use std::time::Instant;
 
 use anyhow::Context;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
 use crate::config::{DailyConfig, FieldValue};
+use crate::copilot::{
+    BatchTask, CopilotCache, CopilotDetail, CopilotRunOptions, ImportKind, ImportProgress,
+    ImportReport, import_source, remove_batch_task, write_batch_task,
+};
+use crate::copilot_run::{BatchPosition, CopilotBatchState};
 use crate::runner::{LogLevel, RunnerEvent, RunningTask, TaskCommand};
 use crate::stage::{StageCatalog, StageRefreshEvent};
+use crate::storage::maa_hot_update_dir;
+use crate::tile_alias;
 
 const MAX_LOG_LINES: usize = 3000;
+const OUTDATED_RESOURCE_HINT: &str = "地图资源可能过旧或关卡码别名缺失：请先热更新资源；MaaTUI 会在启动自动战斗时尝试为 overview 中的关卡码生成 Tile-Pos 别名。若仍失败，检查 `maa dir hot-update` 的 git HEAD 是否落后 remote";
+const OCR_TO_T0_HINT: &str = "关卡码疑似 OCR 将 TO 识别为 T0：请到「更新管理」执行「更新 Core + 基础资源」（需 MaaCore ≥ 6.16）；仅热更新资源通常不够";
 pub const TASK_TYPES: [&str; 8] = [
     "StartUp",
     "Recruit",
@@ -29,17 +40,25 @@ pub enum MainMenuItem {
     Daily,
     Config,
     Copilot,
+    Update,
     Quit,
 }
 
 impl MainMenuItem {
-    pub const ALL: [Self; 4] = [Self::Daily, Self::Config, Self::Copilot, Self::Quit];
+    pub const ALL: [Self; 5] = [
+        Self::Daily,
+        Self::Config,
+        Self::Copilot,
+        Self::Update,
+        Self::Quit,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Daily => "每日任务",
             Self::Config => "配置管理",
             Self::Copilot => "自动战斗",
+            Self::Update => "更新管理",
             Self::Quit => "退出",
         }
     }
@@ -48,7 +67,8 @@ impl MainMenuItem {
         match self {
             Self::Daily => "maa run daily -v",
             Self::Config => "编辑 daily 任务项",
-            Self::Copilot => "maa copilot <作业> -v",
+            Self::Copilot => "单作业 / 作业集（批量）",
+            Self::Update => "手动更新资源或 Core",
             Self::Quit => "安全退出 MaaTUI",
         }
     }
@@ -64,6 +84,7 @@ pub enum Screen {
     VariantList,
     VariantEdit,
     Copilot,
+    Update,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,10 +159,45 @@ pub struct FieldSpec {
     pub editor: FieldEditor,
 }
 
+impl FieldSpec {
+    pub fn display_value(&self, value: &FieldValue) -> String {
+        match &self.editor {
+            FieldEditor::Select { options, .. } => {
+                option_label(options, value).unwrap_or_else(|| value.display())
+            }
+            FieldEditor::MultiSelect { options, .. } => match value {
+                FieldValue::IntegerArray(values) => values
+                    .iter()
+                    .map(|value| {
+                        let value = FieldValue::Integer(*value);
+                        option_label(options, &value).unwrap_or_else(|| value.display())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                FieldValue::StringArray(values) => values
+                    .iter()
+                    .map(|value| {
+                        let value = FieldValue::String(value.clone());
+                        option_label(options, &value).unwrap_or_else(|| value.display())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                _ => value.display(),
+            },
+            _ => value.display(),
+        }
+    }
+}
+
+fn option_label(options: &[SelectOption], value: &FieldValue) -> Option<String> {
+    options
+        .iter()
+        .find(|option| &option.value == value)
+        .map(|option| option.label.clone())
+}
+
 #[derive(Debug, Clone)]
 pub struct CopilotOptions {
-    pub source: String,
-    pub raid: RaidMode,
     pub formation: bool,
     pub formation_index: i64,
     pub use_sanity_potion: bool,
@@ -155,8 +211,6 @@ pub struct CopilotOptions {
 impl Default for CopilotOptions {
     fn default() -> Self {
         Self {
-            source: String::new(),
-            raid: RaidMode::Normal,
             formation: false,
             formation_index: 0,
             use_sanity_potion: false,
@@ -170,53 +224,28 @@ impl Default for CopilotOptions {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RaidMode {
-    Normal,
-    Raid,
-    Both,
+pub enum CopilotSection {
+    Singles,
+    Sets,
+    Settings,
 }
 
-impl RaidMode {
+impl CopilotSection {
+    pub const ALL: [Self; 3] = [Self::Singles, Self::Sets, Self::Settings];
+
     pub fn label(self) -> &'static str {
         match self {
-            Self::Normal => "普通",
-            Self::Raid => "突袭",
-            Self::Both => "普通 + 突袭",
-        }
-    }
-
-    fn cli_value(self) -> &'static str {
-        match self {
-            Self::Normal => "normal",
-            Self::Raid => "raid",
-            Self::Both => "both",
-        }
-    }
-
-    fn next(self) -> Self {
-        match self {
-            Self::Normal => Self::Raid,
-            Self::Raid => Self::Both,
-            Self::Both => Self::Normal,
+            Self::Singles => "单作业",
+            Self::Sets => "作业集（批量）",
+            Self::Settings => "运行设置",
         }
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum CopilotSource {
-    SingleCode(u64),
-    SetCode(u64),
-    Local(String),
-}
-
-impl CopilotSource {
-    fn cli_arg(&self) -> String {
-        match self {
-            Self::SingleCode(code) => format!("maa://{code}"),
-            Self::SetCode(code) => format!("maa://{code}s"),
-            Self::Local(path) => path.clone(),
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportDestination {
+    CurrentSingle,
+    Batch,
 }
 
 #[derive(Debug, Clone)]
@@ -230,7 +259,10 @@ pub enum InputTarget {
         variant: usize,
         field: FieldSpec,
     },
-    CopilotSource,
+    CopilotAdd {
+        kind: ImportKind,
+        destination: ImportDestination,
+    },
     CopilotNumber(CopilotNumberField),
     CopilotText(CopilotTextField),
 }
@@ -274,16 +306,54 @@ pub struct SelectDialog {
     pub target: InputTarget,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum ConfirmTarget {
     DeleteTask(usize),
     DeleteVariant { task: usize, variant: usize },
+    DeleteCopilot(usize),
+    ClearCopilotEntries,
+    RunCommand(TaskCommand),
 }
 
 #[derive(Debug, Clone)]
 pub struct ConfirmDialog {
     pub message: String,
     pub target: ConfirmTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotUpdateVersion {
+    pub activity_name: String,
+    pub last_updated: String,
+}
+
+impl HotUpdateVersion {
+    pub fn summary(&self) -> String {
+        match (self.activity_name.is_empty(), self.last_updated.is_empty()) {
+            (false, false) => format!(
+                "热更新资源 · {} · {}",
+                self.activity_name, self.last_updated
+            ),
+            (false, true) => format!("热更新资源 · {}", self.activity_name),
+            (true, false) => format!("热更新资源 · 更新于 {}", self.last_updated),
+            (true, true) => "热更新资源 · 版本信息缺失".to_string(),
+        }
+    }
+}
+
+enum CopilotImportEvent {
+    Progress(ImportProgress),
+    Finished {
+        destination: ImportDestination,
+        result: Result<ImportReport, String>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct CopilotDetailDialog {
+    pub title: String,
+    pub lines: Vec<String>,
+    pub scroll: u16,
 }
 
 pub struct App {
@@ -296,6 +366,9 @@ pub struct App {
     pub field_idx: usize,
     pub variant_idx: usize,
     pub copilot_idx: usize,
+    pub copilot_settings_idx: usize,
+    pub copilot_section_idx: usize,
+    pub update_idx: usize,
     pub phase: TaskPhase,
     pub logs: VecDeque<LogLine>,
     pub scroll: u16,
@@ -308,11 +381,24 @@ pub struct App {
     pub config: Option<DailyConfig>,
     pub config_error: Option<String>,
     pub copilot: CopilotOptions,
+    pub copilot_cache: Option<CopilotCache>,
+    pub copilot_error: Option<String>,
+    pub current_single_supported_modes: Option<(bool, bool)>,
+    pub copilot_importing: bool,
+    pub copilot_import_progress: Option<ImportProgress>,
     pub stage_catalog: StageCatalog,
     pub input: Option<InputDialog>,
     pub select: Option<SelectDialog>,
     pub confirm: Option<ConfirmDialog>,
+    pub copilot_detail: Option<CopilotDetailDialog>,
     task: Option<RunningTask>,
+    pending_resource_check: bool,
+    resource_version_before: Option<HotUpdateVersion>,
+    saw_outdated_resource_error: bool,
+    saw_ocr_to_t0_error: bool,
+    copilot_batch: Option<CopilotBatchState>,
+    copilot_import_tx: std::sync::mpsc::Sender<CopilotImportEvent>,
+    copilot_import_rx: Receiver<CopilotImportEvent>,
     stage_refresh_tx: std::sync::mpsc::Sender<StageRefreshEvent>,
     stage_refresh_rx: Receiver<StageRefreshEvent>,
     animation_started: Instant,
@@ -324,10 +410,21 @@ impl App {
             Ok(config) => (Some(config), None),
             Err(error) => (None, Some(error.to_string())),
         };
+        let (copilot_cache, copilot_error) = match CopilotCache::load_default() {
+            Ok(cache) => (Some(cache), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        let migrated_single_reset = copilot_cache
+            .as_ref()
+            .is_some_and(CopilotCache::migrated_single_reset);
+        let current_single_supported_modes = copilot_cache
+            .as_ref()
+            .and_then(|cache| cache.current_single_supported_modes().ok());
+        let (copilot_import_tx, copilot_import_rx) = mpsc::channel();
         let (stage_refresh_tx, stage_refresh_rx) = mpsc::channel();
         let stage_catalog = StageCatalog::load_cached();
         StageCatalog::spawn_refresh(stage_refresh_tx.clone());
-        Self {
+        let mut app = Self {
             screen: Screen::Main,
             main_idx: 0,
             daily_idx: 0,
@@ -337,6 +434,9 @@ impl App {
             field_idx: 0,
             variant_idx: 0,
             copilot_idx: 0,
+            copilot_settings_idx: 0,
+            copilot_section_idx: 0,
+            update_idx: 0,
             phase: TaskPhase::Idle,
             logs: VecDeque::new(),
             scroll: 0,
@@ -349,15 +449,35 @@ impl App {
             config,
             config_error,
             copilot: CopilotOptions::default(),
+            copilot_cache,
+            copilot_error,
+            current_single_supported_modes,
+            copilot_importing: false,
+            copilot_import_progress: None,
             stage_catalog,
             input: None,
             select: None,
             confirm: None,
+            copilot_detail: None,
             task: None,
+            pending_resource_check: false,
+            resource_version_before: None,
+            saw_outdated_resource_error: false,
+            saw_ocr_to_t0_error: false,
+            copilot_batch: None,
+            copilot_import_tx,
+            copilot_import_rx,
             stage_refresh_tx,
             stage_refresh_rx,
             animation_started: Instant::now(),
+        };
+        if migrated_single_reset {
+            let message =
+                "缓存已升级：旧单作业列表已清空，请重新搜索当前单作业；作业集列表保持不变";
+            app.status_text = message.to_string();
+            app.push_log(LogLevel::Warn, message);
         }
+        app
     }
 
     pub fn selected_main(&self) -> MainMenuItem {
@@ -368,11 +488,60 @@ impl App {
         EditorSection::ALL[self.section_idx.min(EditorSection::ALL.len() - 1)]
     }
 
+    pub fn copilot_section(&self) -> CopilotSection {
+        CopilotSection::ALL[self.copilot_section_idx.min(CopilotSection::ALL.len() - 1)]
+    }
+
+    pub fn copilot_visible_indices(&self) -> Vec<usize> {
+        if self.copilot_section() != CopilotSection::Sets {
+            return Vec::new();
+        }
+        self.copilot_cache
+            .as_ref()
+            .map_or_else(Vec::new, |cache| (0..cache.entries_len()).collect())
+    }
+
+    fn selected_copilot_index(&self) -> Option<usize> {
+        self.copilot_visible_indices()
+            .get(self.copilot_idx)
+            .copied()
+    }
+
+    fn clamp_copilot_selection(&mut self) {
+        let len = self.copilot_visible_indices().len();
+        self.copilot_idx = self.copilot_idx.min(len.saturating_sub(1));
+    }
+
+    pub fn copilot_batch_progress(&self) -> Option<(usize, usize, String)> {
+        let batch = self.copilot_batch.as_ref()?;
+        match batch.position()? {
+            BatchPosition::Finishing { total } => {
+                Some((total, total, "全部作业已完成，正在收尾".to_string()))
+            }
+            BatchPosition::Running {
+                current,
+                total,
+                index,
+            } => {
+                let name = self
+                    .copilot_cache
+                    .as_ref()
+                    .and_then(|cache| cache.entry(index))
+                    .map(|entry| format!("{} · {}", entry.stage_name, entry.display_name()))
+                    .unwrap_or_else(|| format!("作业 {}", index + 1));
+                Some((current, total, name))
+            }
+        }
+    }
+
     pub fn push_log(&mut self, level: LogLevel, text: impl Into<String>) {
-        self.logs.push_back(LogLine {
-            level,
-            text: text.into(),
-        });
+        let text = text.into();
+        if looks_like_ocr_to_as_t0_error(&text) {
+            self.saw_ocr_to_t0_error = true;
+        } else if looks_like_outdated_resource_error(&text) {
+            self.saw_outdated_resource_error = true;
+        }
+        self.logs.push_back(LogLine { level, text });
         while self.logs.len() > MAX_LOG_LINES {
             self.logs.pop_front();
         }
@@ -386,6 +555,10 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        if self.copilot_detail.is_some() {
+            self.handle_copilot_detail_key(key);
+            return;
+        }
         if self.input.is_some() {
             self.handle_input_key(key);
             return;
@@ -427,10 +600,19 @@ impl App {
             Screen::VariantList => self.handle_variant_list_key(key),
             Screen::VariantEdit => self.handle_variant_edit_key(key),
             Screen::Copilot => self.handle_copilot_key(key),
+            Screen::Update => self.handle_update_key(key),
         }
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.copilot_detail.is_some() {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => self.scroll_copilot_detail_up(3),
+                MouseEventKind::ScrollDown => self.scroll_copilot_detail_down(3),
+                _ => {}
+            }
+            return;
+        }
         match mouse.kind {
             MouseEventKind::ScrollUp => self.scroll_logs_up(3),
             MouseEventKind::ScrollDown => self.scroll_logs_down(3),
@@ -454,7 +636,14 @@ impl App {
                     self.reload_config();
                     self.screen = Screen::Config;
                 }
-                MainMenuItem::Copilot => self.screen = Screen::Copilot,
+                MainMenuItem::Copilot => {
+                    self.copilot_section_idx = 0;
+                    self.screen = Screen::Copilot;
+                }
+                MainMenuItem::Update => {
+                    self.update_idx = 0;
+                    self.screen = Screen::Update;
+                }
                 MainMenuItem::Quit => self.request_quit(),
             },
             _ => {}
@@ -470,13 +659,17 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => {
                 self.daily_idx = (self.daily_idx + 1).min(1);
             }
-            KeyCode::Char('r') => self.start_command(TaskCommand::daily()),
+            KeyCode::Char('r') => {
+                self.start_command(TaskCommand::daily());
+            }
             KeyCode::Char('c') => {
                 self.reload_config();
                 self.screen = Screen::Config;
             }
             KeyCode::Enter => match self.daily_idx {
-                0 => self.start_command(TaskCommand::daily()),
+                0 => {
+                    self.start_command(TaskCommand::daily());
+                }
                 1 => {
                     self.reload_config();
                     self.screen = Screen::Config;
@@ -705,54 +898,290 @@ impl App {
     }
 
     fn handle_copilot_key(&mut self, key: KeyEvent) {
-        const ROWS: usize = 11;
+        match key.code {
+            KeyCode::Tab | KeyCode::Right => {
+                self.copilot_section_idx =
+                    (self.copilot_section_idx + 1) % CopilotSection::ALL.len();
+                self.clamp_copilot_selection();
+                return;
+            }
+            KeyCode::Left => {
+                self.copilot_section_idx = self.copilot_section_idx.saturating_sub(1);
+                self.clamp_copilot_selection();
+                return;
+            }
+            _ => {}
+        }
+
+        match self.copilot_section() {
+            CopilotSection::Singles => self.handle_single_copilot_key(key),
+            CopilotSection::Sets => self.handle_copilot_list_key(key),
+            CopilotSection::Settings => self.handle_copilot_settings_key(key),
+        }
+    }
+
+    fn handle_single_copilot_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.screen = Screen::Main,
+            KeyCode::Char('a') | KeyCode::Char('e') => self.open_input(
+                "搜索当前单作业：代码 / URI / 本地 JSON".to_string(),
+                String::new(),
+                InputTarget::CopilotAdd {
+                    kind: ImportKind::Single,
+                    destination: ImportDestination::CurrentSingle,
+                },
+            ),
+            KeyCode::Char(' ') => self.toggle_current_single_difficulty(),
+            KeyCode::Char('i') => self.open_current_single_detail(),
+            KeyCode::Enter => self.start_current_single_copilot(),
+            _ => {}
+        }
+    }
+
+    fn toggle_current_single_difficulty(&mut self) {
+        let result = self
+            .copilot_cache
+            .as_mut()
+            .context("作业缓存未加载")
+            .and_then(CopilotCache::toggle_current_single_raid);
+        match result {
+            Ok(is_raid) => {
+                self.status_text = format!(
+                    "当前单作业已切换为{}模式",
+                    if is_raid { "突袭" } else { "普通" }
+                );
+                self.last_failed = false;
+            }
+            Err(error) => self.status_error(error.to_string()),
+        }
+    }
+
+    fn handle_copilot_list_key(&mut self, key: KeyEvent) {
+        let visible = self.copilot_visible_indices();
+        let len = visible.len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.screen = Screen::Main,
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                if self.copilot_idx > 0 {
+                    let from = visible[self.copilot_idx];
+                    let to = visible[self.copilot_idx - 1];
+                    if self.apply_copilot_cache(|cache| cache.swap_entries(from, to)) {
+                        self.copilot_idx -= 1;
+                    }
+                }
+            }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                if self.copilot_idx + 1 < len {
+                    let from = visible[self.copilot_idx];
+                    let to = visible[self.copilot_idx + 1];
+                    if self.apply_copilot_cache(|cache| cache.swap_entries(from, to)) {
+                        self.copilot_idx += 1;
+                    }
+                }
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.copilot_idx = self.copilot_idx.saturating_sub(1)
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.copilot_idx = (self.copilot_idx + 1).min(ROWS - 1);
+                if len > 0 {
+                    self.copilot_idx = (self.copilot_idx + 1).min(len - 1);
+                }
             }
-            KeyCode::Char('r') => self.start_copilot(),
-            KeyCode::Enter | KeyCode::Char('e') => match self.copilot_idx {
-                0 => self.open_input(
-                    "作业代码 / URI / 本地 JSON".to_string(),
-                    self.copilot.source.clone(),
-                    InputTarget::CopilotSource,
-                ),
-                1 => self.copilot.raid = self.copilot.raid.next(),
-                2 => self.copilot.formation = !self.copilot.formation,
-                3 => self.open_select(
+            KeyCode::Char(' ') if len > 0 => {
+                let index = visible[self.copilot_idx];
+                self.apply_copilot_cache(|cache| cache.toggle(index).map(|_| ()));
+            }
+            KeyCode::Char('a') if !self.copilot_importing => {
+                self.open_input(
+                    "添加作业集  |  → 添加单个作业".to_string(),
+                    String::new(),
+                    InputTarget::CopilotAdd {
+                        kind: ImportKind::Set,
+                        destination: ImportDestination::Batch,
+                    },
+                );
+            }
+            KeyCode::Char('t') if len > 0 => {
+                let enable = self
+                    .copilot_cache
+                    .as_ref()
+                    .is_some_and(|cache| cache.enabled_count() == 0);
+                if self.apply_copilot_cache(|cache| cache.set_all_enabled(enable)) {
+                    self.status_text = format!(
+                        "已{}全部 {len} 个作业",
+                        if enable { "启用" } else { "禁用" }
+                    );
+                }
+            }
+            KeyCode::Char('c') if len > 0 => {
+                self.confirm = Some(ConfirmDialog {
+                    message: format!("确认清空全部 {len} 个批量作业？此操作会立即保存。"),
+                    target: ConfirmTarget::ClearCopilotEntries,
+                });
+            }
+            KeyCode::Char('i') if len > 0 => self.open_selected_copilot_detail(),
+            KeyCode::Char('d') if len > 0 => {
+                let index = visible[self.copilot_idx];
+                let name = self
+                    .copilot_cache
+                    .as_ref()
+                    .and_then(|cache| cache.entry(index))
+                    .map(|entry| entry.display_name())
+                    .unwrap_or_else(|| "当前作业".to_string());
+                self.confirm = Some(ConfirmDialog {
+                    message: format!("确认删除“{name}”？此操作会立即保存。"),
+                    target: ConfirmTarget::DeleteCopilot(index),
+                });
+            }
+            KeyCode::Enter | KeyCode::Char('e') if len > 0 => self.start_selected_copilot(),
+            KeyCode::Char('r') => self.start_copilot_batch(),
+            _ => {}
+        }
+    }
+
+    fn handle_copilot_settings_key(&mut self, key: KeyEvent) {
+        const ROWS: usize = 8;
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.screen = Screen::Main,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.copilot_settings_idx = self.copilot_settings_idx.saturating_sub(1)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.copilot_settings_idx = (self.copilot_settings_idx + 1).min(ROWS - 1);
+            }
+            KeyCode::Char('r') => self.start_copilot_batch(),
+            KeyCode::Enter | KeyCode::Char('e') => match self.copilot_settings_idx {
+                0 => self.copilot.formation = !self.copilot.formation,
+                1 => self.open_select(
                     "编队编号".to_string(),
                     FieldValue::Integer(self.copilot.formation_index),
                     copilot_formation_options(),
                     false,
                     InputTarget::CopilotNumber(CopilotNumberField::FormationIndex),
                 ),
-                4 => self.copilot.use_sanity_potion = !self.copilot.use_sanity_potion,
-                5 => self.copilot.add_trust = !self.copilot.add_trust,
-                6 => self.copilot.ignore_requirements = !self.copilot.ignore_requirements,
-                7 => self.open_select(
+                2 => self.copilot.use_sanity_potion = !self.copilot.use_sanity_potion,
+                3 => self.copilot.add_trust = !self.copilot.add_trust,
+                4 => self.copilot.ignore_requirements = !self.copilot.ignore_requirements,
+                5 => self.open_select(
                     "助战模式".to_string(),
                     FieldValue::Integer(self.copilot.support_unit_usage),
                     support_usage_options(),
                     false,
                     InputTarget::CopilotNumber(CopilotNumberField::SupportUsage),
                 ),
-                8 => self.open_input(
+                6 => self.open_input(
                     "指定助战干员".to_string(),
                     self.copilot.support_unit_name.clone(),
                     InputTarget::CopilotText(CopilotTextField::SupportName),
                 ),
-                9 => self.open_input(
-                    "循环次数（大于 0）".to_string(),
+                7 => self.open_input(
+                    "循环次数（仅单作业，大于 0）".to_string(),
                     self.copilot.loop_times.to_string(),
                     InputTarget::CopilotNumber(CopilotNumberField::LoopTimes),
                 ),
-                10 => self.start_copilot(),
                 _ => {}
             },
+            _ => {}
+        }
+    }
+
+    fn open_current_single_detail(&mut self) {
+        let result = self
+            .copilot_cache
+            .as_ref()
+            .context("作业缓存未加载")
+            .and_then(CopilotCache::current_single_detail);
+        match result {
+            Ok(CopilotDetail { title, lines }) => {
+                self.copilot_detail = Some(CopilotDetailDialog {
+                    title: format!("单作业详情 · {title}"),
+                    lines,
+                    scroll: 0,
+                });
+            }
+            Err(error) => self.status_error(error.to_string()),
+        }
+    }
+
+    fn open_selected_copilot_detail(&mut self) {
+        let Some(index) = self.selected_copilot_index() else {
+            return;
+        };
+        let result = self
+            .copilot_cache
+            .as_ref()
+            .context("作业列表未加载")
+            .and_then(|cache| cache.detail(index));
+        match result {
+            Ok(CopilotDetail { title, lines }) => {
+                let context = match self.copilot_section() {
+                    CopilotSection::Singles => "单作业",
+                    CopilotSection::Sets => "作业集条目",
+                    CopilotSection::Settings => "作业",
+                };
+                self.copilot_detail = Some(CopilotDetailDialog {
+                    title: format!("{context}详情 · {title}"),
+                    lines,
+                    scroll: 0,
+                });
+            }
+            Err(error) => self.status_error(error.to_string()),
+        }
+    }
+
+    fn handle_copilot_detail_key(&mut self, key: KeyEvent) {
+        let Some(detail) = self.copilot_detail.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.copilot_detail = None,
+            KeyCode::Up | KeyCode::Char('k') => detail.scroll = detail.scroll.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => detail.scroll = detail.scroll.saturating_add(1),
+            KeyCode::PageUp => detail.scroll = detail.scroll.saturating_sub(10),
+            KeyCode::PageDown => detail.scroll = detail.scroll.saturating_add(10),
+            KeyCode::Home => detail.scroll = 0,
+            KeyCode::End => detail.scroll = u16::MAX,
+            _ => {}
+        }
+    }
+
+    fn scroll_copilot_detail_up(&mut self, amount: u16) {
+        if let Some(detail) = self.copilot_detail.as_mut() {
+            detail.scroll = detail.scroll.saturating_sub(amount);
+        }
+    }
+
+    fn scroll_copilot_detail_down(&mut self, amount: u16) {
+        if let Some(detail) = self.copilot_detail.as_mut() {
+            detail.scroll = detail.scroll.saturating_add(amount);
+        }
+    }
+
+    fn handle_update_key(&mut self, key: KeyEvent) {
+        const ROWS: usize = 2;
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.screen = Screen::Main,
+            KeyCode::Up | KeyCode::Char('k') => self.update_idx = self.update_idx.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.update_idx = (self.update_idx + 1).min(ROWS - 1);
+            }
+            KeyCode::Enter => {
+                let (message, command) = match self.update_idx {
+                    0 => (
+                        "确认联网更新 MaaResource 热更新资源？",
+                        TaskCommand::resource_update(),
+                    ),
+                    1 => (
+                        "确认更新 MaaCore 与随包基础资源？",
+                        TaskCommand::core_update(),
+                    ),
+                    _ => return,
+                };
+                self.confirm = Some(ConfirmDialog {
+                    message: message.to_string(),
+                    target: ConfirmTarget::RunCommand(command),
+                });
+            }
             _ => {}
         }
     }
@@ -761,6 +1190,35 @@ impl App {
         match key.code {
             KeyCode::Esc => self.input = None,
             KeyCode::Enter => self.commit_input(),
+            KeyCode::Left | KeyCode::Right
+                if self.input.as_ref().is_some_and(|input| {
+                    matches!(
+                        input.target,
+                        InputTarget::CopilotAdd {
+                            destination: ImportDestination::Batch,
+                            ..
+                        }
+                    )
+                }) =>
+            {
+                if let Some(input) = self.input.as_mut()
+                    && let InputTarget::CopilotAdd { kind, .. } = &mut input.target
+                {
+                    *kind = match *kind {
+                        ImportKind::Set => ImportKind::Single,
+                        ImportKind::Single => ImportKind::Set,
+                    };
+                    input.title = match *kind {
+                        ImportKind::Set => "添加作业集  |  → 添加单个作业".to_string(),
+                        ImportKind::Single => "← 添加作业集  |  添加单个作业".to_string(),
+                    };
+                }
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(input) = self.input.as_mut() {
+                    input.value.clear();
+                }
+            }
             KeyCode::Backspace => {
                 if let Some(input) = self.input.as_mut() {
                     input.value.pop();
@@ -894,7 +1352,7 @@ impl App {
                 };
                 self.set_copilot_number(field, value)
             }
-            InputTarget::CopilotSource | InputTarget::CopilotText(_) => {
+            InputTarget::CopilotAdd { .. } | InputTarget::CopilotText(_) => {
                 anyhow::bail!("该字段不支持选项选择")
             }
         }
@@ -940,6 +1398,17 @@ impl App {
                                 .as_ref()
                                 .map_or(0, |config| config.variant_count(task));
                             self.variant_idx = self.variant_idx.min(len.saturating_sub(1));
+                        }
+                        ConfirmTarget::DeleteCopilot(index) => {
+                            self.apply_copilot_cache(|cache| cache.delete(index));
+                            self.clamp_copilot_selection();
+                        }
+                        ConfirmTarget::ClearCopilotEntries => {
+                            self.apply_copilot_cache(CopilotCache::clear_entries);
+                            self.copilot_idx = 0;
+                        }
+                        ConfirmTarget::RunCommand(command) => {
+                            self.start_command(command);
                         }
                     }
                 }
@@ -1038,9 +1507,14 @@ impl App {
                 FieldValue::parse_like(&dialog.value, Some(&current))
                     .and_then(|value| self.set_variant_field_result(task, variant, &field, value))
             }
-            InputTarget::CopilotSource => {
-                self.copilot.source = dialog.value.trim().to_string();
-                Ok(())
+            InputTarget::CopilotAdd { kind, destination } => {
+                let input = dialog.value.trim().to_string();
+                if input.is_empty() {
+                    Err(anyhow::anyhow!("请输入作业代码、URI 或本地 JSON 路径"))
+                } else {
+                    self.start_copilot_import(kind, destination, input);
+                    Ok(())
+                }
             }
             InputTarget::CopilotNumber(field) => dialog
                 .value
@@ -1235,6 +1709,22 @@ impl App {
         task_fields(&task_type, self.editor_section() == EditorSection::Advanced)
     }
 
+    pub fn task_field_display(&self, field: &FieldSpec, value: &FieldValue) -> String {
+        if matches!(field.editor, FieldEditor::Stage { .. }) {
+            option_label(&self.dynamic_stage_options(), value).unwrap_or_else(|| value.display())
+        } else {
+            field.display_value(value)
+        }
+    }
+
+    pub fn variant_field_display(&self, field: &FieldSpec, value: &FieldValue) -> String {
+        if matches!(field.editor, FieldEditor::Stage { .. }) {
+            option_label(&self.dynamic_stage_options(), value).unwrap_or_else(|| value.display())
+        } else {
+            field.display_value(value)
+        }
+    }
+
     pub fn task_field_value(&self, field: &FieldSpec) -> Option<FieldValue> {
         let config = self.config.as_ref()?;
         match field.scope {
@@ -1326,6 +1816,171 @@ impl App {
         }
     }
 
+    fn apply_copilot_cache<F>(&mut self, operation: F) -> bool
+    where
+        F: FnOnce(&mut CopilotCache) -> anyhow::Result<()>,
+    {
+        let result = self
+            .copilot_cache
+            .as_mut()
+            .context("作业列表未加载")
+            .and_then(operation);
+        match result {
+            Ok(()) => {
+                self.status_text = "作业列表已自动保存".to_string();
+                self.last_failed = false;
+                true
+            }
+            Err(error) => {
+                self.status_error(error.to_string());
+                false
+            }
+        }
+    }
+
+    fn start_copilot_import(
+        &mut self,
+        kind: ImportKind,
+        destination: ImportDestination,
+        input: String,
+    ) {
+        if self.copilot_importing {
+            self.status_error("已有作业正在导入".to_string());
+            return;
+        }
+        let Some(cache) = self.copilot_cache.as_ref() else {
+            self.status_error(
+                self.copilot_error
+                    .clone()
+                    .unwrap_or_else(|| "作业列表未加载".to_string()),
+            );
+            return;
+        };
+        let files_dir = cache.files_dir().to_path_buf();
+        let tx = self.copilot_import_tx.clone();
+        self.copilot_importing = true;
+        self.copilot_import_progress = None;
+        self.last_failed = false;
+        self.status_text = match kind {
+            ImportKind::Single => "正在导入单作业…".to_string(),
+            ImportKind::Set => "正在导入作业集…".to_string(),
+        };
+        if let Err(error) = thread::Builder::new()
+            .name("maatui-copilot-import".to_string())
+            .spawn(move || {
+                let result = import_source(&input, kind, &files_dir, |progress| {
+                    let _ = tx.send(CopilotImportEvent::Progress(progress));
+                })
+                .map_err(|error| format!("{error:#}"));
+                let _ = tx.send(CopilotImportEvent::Finished {
+                    destination,
+                    result,
+                });
+            })
+        {
+            self.copilot_importing = false;
+            self.status_error(format!("启动作业导入线程失败: {error}"));
+        }
+    }
+
+    fn poll_copilot_import(&mut self) {
+        while let Ok(event) = self.copilot_import_rx.try_recv() {
+            match event {
+                CopilotImportEvent::Progress(progress) => {
+                    self.status_text = if progress.total > 0 {
+                        format!(
+                            "导入作业 {}/{} · {}",
+                            progress.completed, progress.total, progress.label
+                        )
+                    } else {
+                        progress.label.clone()
+                    };
+                    self.copilot_import_progress = Some(progress);
+                }
+                CopilotImportEvent::Finished {
+                    destination,
+                    result,
+                } => {
+                    self.copilot_importing = false;
+                    self.copilot_import_progress = None;
+                    match result {
+                        Ok(report) => self.finish_copilot_import(destination, report),
+                        Err(error) => self.status_error(error),
+                    }
+                }
+            }
+        }
+    }
+
+    fn finish_copilot_import(&mut self, destination: ImportDestination, mut report: ImportReport) {
+        if destination == ImportDestination::CurrentSingle {
+            let added = report.entries.len();
+            let Some(mut entry) = report.entries.drain(..).next() else {
+                self.status_error("作业未生成可运行模式".to_string());
+                return;
+            };
+            entry.origin = crate::copilot::CopilotOrigin::Single;
+            if !self.apply_copilot_cache(|cache| cache.replace_current_single(Some(entry))) {
+                return;
+            }
+            self.current_single_supported_modes = self
+                .copilot_cache
+                .as_ref()
+                .and_then(|cache| cache.current_single_supported_modes().ok());
+            self.copilot_section_idx = 0;
+            self.status_text = if added > 1 {
+                "已替换当前单作业；支持普通与突袭，按 Space 切换本次运行模式".to_string()
+            } else {
+                "已替换当前单作业".to_string()
+            };
+            return;
+        }
+
+        for entry in &mut report.entries {
+            if report.set_id.is_none() {
+                entry.origin = crate::copilot::CopilotOrigin::Single;
+            }
+        }
+        let added = report.entries.len();
+        let first = if added > 0 {
+            let mut first = None;
+            let entries = report.entries;
+            if self.apply_copilot_cache(|cache| {
+                first = Some(cache.append(entries)?);
+                Ok(())
+            }) {
+                first
+            } else {
+                return;
+            }
+        } else {
+            None
+        };
+        if let Some(index) = first {
+            self.copilot_section_idx = 1;
+            self.copilot_idx = index;
+        }
+        if let Some(id) = report.set_id {
+            let label = report
+                .set_name
+                .as_deref()
+                .map_or_else(|| format!("#{id}"), |name| format!("{name} (#{id})"));
+            self.push_log(LogLevel::System, format!("作业集：{label}"));
+        }
+        if let Some(description) = report.set_description {
+            self.push_log(LogLevel::Plain, description);
+        }
+        for error in &report.errors {
+            self.push_log(LogLevel::Warn, format!("作业导入失败：{error}"));
+        }
+        self.status_text = if report.errors.is_empty() {
+            format!("已添加 {added} 个作业")
+        } else {
+            format!("已添加 {added} 个作业，{} 个失败", report.errors.len())
+        };
+        self.last_failed = added == 0 && !report.errors.is_empty();
+    }
+
     fn reload_config(&mut self) {
         match DailyConfig::load_default() {
             Ok(config) => {
@@ -1345,25 +2000,108 @@ impl App {
         }
     }
 
-    fn start_copilot(&mut self) {
-        let source = match parse_copilot_source(&self.copilot.source) {
-            Ok(CopilotSource::SetCode(_)) => {
-                self.status_error("已识别作业集，但首版暂未开放作业集执行".to_string());
+    fn start_current_single_copilot(&mut self) {
+        let command = match self.current_single_copilot_command() {
+            Ok(command) => command,
+            Err(error) => {
+                self.status_error(error.to_string());
                 return;
             }
-            Ok(source) => source,
+        };
+        self.ensure_tile_pos_aliases();
+        self.start_command(command);
+    }
+
+    fn current_single_copilot_command(&self) -> anyhow::Result<TaskCommand> {
+        let cache = self.copilot_cache.as_ref().context("作业缓存未加载")?;
+        let entry = cache.current_single().context("请先搜索当前单作业")?;
+        let path = cache
+            .current_single_path()
+            .context("无法解析作业文件路径")?;
+        self.single_copilot_command(entry, path)
+    }
+
+    fn start_selected_copilot(&mut self) {
+        let command = match self.selected_copilot_command() {
+            Ok(command) => command,
             Err(error) => {
-                self.status_error(error);
+                self.status_error(error.to_string());
+                return;
+            }
+        };
+        self.ensure_tile_pos_aliases();
+        self.start_command(command);
+    }
+
+    fn selected_copilot_command(&self) -> anyhow::Result<TaskCommand> {
+        let cache = self.copilot_cache.as_ref().context("作业列表未加载")?;
+        let index = self
+            .selected_copilot_index()
+            .context("请选择要运行的作业")?;
+        let entry = cache.entry(index).context("请选择要运行的作业")?;
+        let path = cache
+            .resolved_file_path(index)
+            .context("无法解析作业文件路径")?;
+        self.single_copilot_command(entry, path)
+    }
+
+    fn single_copilot_command(
+        &self,
+        entry: &crate::copilot::CopilotEntry,
+        path: PathBuf,
+    ) -> anyhow::Result<TaskCommand> {
+        if !path.is_file() {
+            anyhow::bail!("作业文件不存在: {}", path.display());
+        }
+        let mut args = vec![
+            "copilot".to_string(),
+            path.display().to_string(),
+            "--raid".to_string(),
+            if entry.is_raid { "raid" } else { "normal" }.to_string(),
+        ];
+        self.append_single_copilot_options(&mut args);
+        Ok(TaskCommand::copilot(args))
+    }
+
+    fn start_copilot_batch(&mut self) {
+        let Some(cache) = self.copilot_cache.as_ref() else {
+            self.status_error("作业列表未加载".to_string());
+            return;
+        };
+        let indices = cache.enabled_indices();
+        let options = CopilotRunOptions {
+            formation_index: self.copilot.formation_index,
+            use_sanity_potion: self.copilot.use_sanity_potion,
+            add_trust: self.copilot.add_trust,
+            ignore_requirements: self.copilot.ignore_requirements,
+            support_unit_usage: self.copilot.support_unit_usage,
+            support_unit_name: self.copilot.support_unit_name.clone(),
+        };
+        let BatchTask { path, indices } = match write_batch_task(cache, indices, &options) {
+            Ok(task) => task,
+            Err(error) => {
+                self.status_error(error.to_string());
                 return;
             }
         };
 
-        let mut args = vec![
-            "copilot".to_string(),
-            source.cli_arg(),
-            "--raid".to_string(),
-            self.copilot.raid.cli_value().to_string(),
-        ];
+        self.ensure_tile_pos_aliases();
+        let command = TaskCommand::copilot_batch(&path.display().to_string());
+        if self.start_command(command) {
+            let total = indices.len();
+            let current_name = indices
+                .first()
+                .and_then(|&index| self.copilot_cache.as_ref()?.entry(index))
+                .map(|entry| format!("{} · {}", entry.stage_name, entry.display_name()))
+                .unwrap_or_else(|| "未知作业".to_string());
+            self.status_text = format!("作业集运行中 · 1/{total} · {current_name}");
+            self.copilot_batch = Some(CopilotBatchState::new(path, indices));
+        } else {
+            remove_batch_task(&path);
+        }
+    }
+
+    fn append_single_copilot_options(&self, args: &mut Vec<String>) {
         if self.copilot.formation {
             args.push("--formation".to_string());
         }
@@ -1397,16 +2135,24 @@ impl App {
         args.extend([
             "--loop-times".to_string(),
             self.copilot.loop_times.to_string(),
+            "--batch".to_string(),
             "-v".to_string(),
         ]);
-        self.start_command(TaskCommand::copilot(args));
     }
 
-    fn start_command(&mut self, command: TaskCommand) {
+    fn start_command(&mut self, command: TaskCommand) -> bool {
         self.logs.clear();
         self.scroll = 0;
         self.auto_scroll = true;
         self.last_failed = false;
+        self.saw_outdated_resource_error = false;
+        self.saw_ocr_to_t0_error = false;
+        self.pending_resource_check = is_resource_update_command(&command);
+        self.resource_version_before = if self.pending_resource_check {
+            read_hot_update_version()
+        } else {
+            None
+        };
         self.push_log(LogLevel::System, format!("启动: {}", command.display()));
         self.status_text = format!("正在启动{}…", command.label);
 
@@ -1418,11 +2164,15 @@ impl App {
                 self.animation_started = Instant::now();
                 self.active_label = command.label;
                 self.status_text = format!("{}运行中", self.active_label);
+                true
             }
             Err(error) => {
+                self.pending_resource_check = false;
+                self.resource_version_before = None;
                 self.push_log(LogLevel::Error, error);
                 self.status_text = "启动失败".to_string();
                 self.last_failed = true;
+                false
             }
         }
     }
@@ -1452,6 +2202,7 @@ impl App {
 
     pub fn tick(&mut self) {
         self.poll_stage_refresh();
+        self.poll_copilot_import();
         let events = self
             .task
             .as_mut()
@@ -1459,6 +2210,15 @@ impl App {
         for event in events {
             match event {
                 RunnerEvent::Line { level, text } => self.push_log(level, text),
+                RunnerEvent::CopilotStageSucceeded => self.on_copilot_stage_succeeded(),
+                RunnerEvent::CopilotProgressFailed(error) => {
+                    let message = format!("读取 MaaCore 作业进度失败，已停止批次: {error}");
+                    if let Some(batch) = self.copilot_batch.as_mut() {
+                        batch.set_abort_error(message.clone());
+                    }
+                    self.request_stop();
+                    self.status_error(message);
+                }
                 RunnerEvent::Exited { code, stopped } => self.on_exited(code, stopped),
             }
         }
@@ -1506,22 +2266,112 @@ impl App {
         }
     }
 
+    fn on_copilot_stage_succeeded(&mut self) {
+        let Some(completion) = self
+            .copilot_batch
+            .as_ref()
+            .and_then(CopilotBatchState::current_completion)
+        else {
+            return;
+        };
+        let index = completion.index;
+        let total = completion.total;
+        let completed = completion.completed;
+        let name = self
+            .copilot_cache
+            .as_ref()
+            .and_then(|cache| cache.entry(index))
+            .map(|entry| entry.display_name())
+            .unwrap_or_else(|| format!("作业 {}", index + 1));
+        let result = self
+            .copilot_cache
+            .as_mut()
+            .context("作业列表未加载")
+            .and_then(|cache| cache.set_enabled(index, false));
+        match result {
+            Ok(()) => {
+                if let Some(batch) = self.copilot_batch.as_mut() {
+                    batch.mark_success();
+                }
+                self.push_log(
+                    LogLevel::Success,
+                    format!("已完成并关闭 [{completed}/{total}] {name}"),
+                );
+                self.status_text = if completed < total {
+                    let next = self
+                        .copilot_batch
+                        .as_ref()
+                        .and_then(|batch| match batch.position()? {
+                            BatchPosition::Running { index, .. } => Some(index),
+                            BatchPosition::Finishing { .. } => None,
+                        })
+                        .and_then(|index| self.copilot_cache.as_ref()?.entry(index))
+                        .map(|entry| format!("{} · {}", entry.stage_name, entry.display_name()))
+                        .unwrap_or_else(|| "未知作业".to_string());
+                    format!("作业集运行中 · {}/{total} · {next}", completed + 1)
+                } else {
+                    format!("作业集运行中 · {total}/{total} · 正在收尾")
+                };
+            }
+            Err(error) => {
+                let message = format!("保存成功作业状态失败，已停止批次: {error}");
+                if let Some(batch) = self.copilot_batch.as_mut() {
+                    batch.set_abort_error(message.clone());
+                }
+                self.request_stop();
+                self.status_error(message);
+            }
+        }
+    }
+
     fn on_exited(&mut self, code: Option<i32>, stopped: bool) {
         let code_text = code.map_or_else(|| "?".to_string(), |code| code.to_string());
-        if stopped {
+        let check_resource = self.pending_resource_check;
+        let version_before = self.resource_version_before.take();
+        self.pending_resource_check = false;
+        let mut batch_state_error = None;
+        let mut batch_abort_error = None;
+        if let Some(batch) = self.copilot_batch.take() {
+            let exit = batch.finish(code, stopped);
+            batch_abort_error = exit.abort_error;
+            if !exit.reconcile_indices.is_empty() {
+                let result = self
+                    .copilot_cache
+                    .as_mut()
+                    .context("作业列表未加载")
+                    .and_then(|cache| cache.set_enabled_many(&exit.reconcile_indices, false));
+                if let Err(error) = result {
+                    batch_state_error = Some(error.to_string());
+                } else {
+                    self.push_log(
+                        LogLevel::Warn,
+                        format!(
+                            "批次整体成功；已补记 {} 个未收到逐关日志的成功项",
+                            exit.reconcile_indices.len()
+                        ),
+                    );
+                }
+            }
+            remove_batch_task(&exit.task_path);
+        }
+
+        if stopped && batch_abort_error.is_none() {
             self.push_log(
                 LogLevel::Warn,
                 format!("{}已停止 (exit {code_text})", self.active_label),
             );
             self.status_text = format!("已停止 · exit {code_text}");
             self.last_failed = false;
-        } else if code == Some(0) {
+        } else if code == Some(0) && batch_state_error.is_none() {
             self.push_log(
                 LogLevel::Success,
                 format!("{}完成 (exit {code_text})", self.active_label),
             );
             self.status_text = format!("已完成 · exit {code_text}");
             self.last_failed = false;
+            if check_resource {
+                self.report_resource_update_result(version_before.as_ref());
+            }
         } else {
             self.push_log(
                 LogLevel::Error,
@@ -1529,17 +2379,70 @@ impl App {
             );
             self.status_text = format!("失败 · exit {code_text}");
             self.last_failed = true;
+            if let Some(error) = batch_abort_error {
+                self.push_log(LogLevel::Error, error);
+            }
+            if let Some(error) = batch_state_error {
+                self.push_log(LogLevel::Error, format!("保存作业列表失败: {error}"));
+            }
+            if self.saw_ocr_to_t0_error {
+                self.push_log(LogLevel::System, OCR_TO_T0_HINT);
+            } else if self.saw_outdated_resource_error {
+                self.push_log(LogLevel::System, OUTDATED_RESOURCE_HINT);
+            }
         }
         self.task = None;
         self.phase = TaskPhase::Idle;
         self.started_at = None;
         self.active_label.clear();
+        self.saw_outdated_resource_error = false;
+        self.saw_ocr_to_t0_error = false;
         self.auto_scroll = true;
+    }
+
+    fn report_resource_update_result(&mut self, before: Option<&HotUpdateVersion>) {
+        match read_hot_update_version() {
+            Some(after) => {
+                let summary = after.summary();
+                if before.is_some_and(|before| before == &after) {
+                    self.push_log(
+                        LogLevel::Warn,
+                        "热更新报告成功，但本地 version.json 未变化，可能未拉到新提交",
+                    );
+                    self.status_text = format!("{summary} · 未变化");
+                } else {
+                    self.push_log(LogLevel::System, &summary);
+                    self.status_text = summary;
+                }
+            }
+            None => {
+                self.push_log(
+                    LogLevel::Warn,
+                    "热更新完成，但无法读取本地 version.json；请检查 `maa dir hot-update`",
+                );
+            }
+        }
+        self.ensure_tile_pos_aliases();
+    }
+
+    fn ensure_tile_pos_aliases(&mut self) {
+        let report = tile_alias::ensure_stage_code_aliases();
+        if let Some(summary) = report.summary() {
+            let level = if report.errors.is_empty() {
+                LogLevel::System
+            } else {
+                LogLevel::Warn
+            };
+            self.push_log(level, summary);
+        }
     }
 
     pub fn cleanup(&mut self) {
         if let Some(task) = self.task.take() {
             task.force_cleanup();
+        }
+        if let Some(batch) = self.copilot_batch.take() {
+            remove_batch_task(batch.task_path());
         }
         self.phase = TaskPhase::Idle;
     }
@@ -1570,37 +2473,6 @@ impl Default for App {
     fn default() -> Self {
         Self::new()
     }
-}
-
-pub fn parse_copilot_source(input: &str) -> Result<CopilotSource, String> {
-    let value = input.trim();
-    if value.is_empty() {
-        return Err("请输入作业代码、maa:// URI 或本地 JSON 路径".to_string());
-    }
-    if value.chars().all(|character| character.is_ascii_digit()) {
-        return value
-            .parse()
-            .map(CopilotSource::SingleCode)
-            .map_err(|_| "作业代码无效".to_string());
-    }
-    for prefix in ["maa://", "prts://"] {
-        if let Some(code) = value.strip_prefix(prefix) {
-            if let Some(code) = code.strip_suffix('s') {
-                return code
-                    .parse()
-                    .map(CopilotSource::SetCode)
-                    .map_err(|_| "作业集代码无效".to_string());
-            }
-            return code
-                .parse()
-                .map(CopilotSource::SingleCode)
-                .map_err(|_| "作业代码无效".to_string());
-        }
-    }
-    if value.starts_with("file://") || Path::new(value).extension().is_some() {
-        return Ok(CopilotSource::Local(value.to_string()));
-    }
-    Err("无法识别作业来源；支持纯数字、maa://、prts:// 和本地 JSON".to_string())
 }
 
 pub fn task_fields(task_type: &str, advanced: bool) -> Vec<FieldSpec> {
@@ -2193,12 +3065,145 @@ fn integers(values: &[i64]) -> FieldValue {
     FieldValue::IntegerArray(values.to_vec())
 }
 
+fn is_resource_update_command(command: &TaskCommand) -> bool {
+    command.args.first().is_some_and(|arg| arg == "hot-update")
+        || command.label.contains("资源热更新")
+}
+
+fn looks_like_outdated_resource_error(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("tile-pos")
+        || lower.contains("resources may be outdated")
+        || lower.contains("unsupportedlevel")
+        || text.contains("资源可能过旧")
+        || text.contains("资源过旧")
+}
+
+fn looks_like_ocr_to_as_t0_error(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("tile-pos") && lower.contains("t0-")
+}
+
+fn hot_update_version_path() -> PathBuf {
+    maa_hot_update_dir()
+        .unwrap_or_else(|_| PathBuf::from(".local/share/maa/MaaResource"))
+        .join("resource/version.json")
+}
+
+fn read_hot_update_version() -> Option<HotUpdateVersion> {
+    parse_hot_update_version(&fs::read_to_string(hot_update_version_path()).ok()?)
+}
+
+fn parse_hot_update_version(raw: &str) -> Option<HotUpdateVersion> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let activity_name = value
+        .pointer("/activity/name")
+        .and_then(|item| item.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let last_updated = value
+        .get("last_updated")
+        .and_then(|item| item.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if activity_name.is_empty() && last_updated.is_empty() {
+        return None;
+    }
+    Some(HotUpdateVersion {
+        activity_name,
+        last_updated,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::copilot::{CopilotEntry, CopilotEntrySource, CopilotOrigin};
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn hot_update_env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn test_copilot_cache(count: usize) -> (PathBuf, CopilotCache) {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("maatui-app-copilot-{unique}"));
+        let path = dir.join("copilot-set.json");
+        let files = dir.join("files");
+        fs::create_dir_all(&files).unwrap();
+        let mut cache = CopilotCache::load(path, files).unwrap();
+        cache
+            .append(
+                (0..count)
+                    .map(|index| {
+                        let file = dir.join(format!("{}.json", index + 1));
+                        fs::write(&file, "{}").unwrap();
+                        CopilotEntry {
+                            enabled: true,
+                            stage_name: format!("TO-{}", index + 1),
+                            title: None,
+                            is_raid: false,
+                            source: CopilotEntrySource::Local { path: file },
+                            origin: CopilotOrigin::Single,
+                        }
+                    })
+                    .collect(),
+            )
+            .unwrap();
+        (dir, cache)
+    }
+
+    fn test_current_single_cache() -> (PathBuf, CopilotCache) {
+        let (dir, mut cache) = test_copilot_cache(0);
+        let file = dir.join("single.json");
+        fs::write(&file, "{}").unwrap();
+        cache
+            .replace_current_single(Some(CopilotEntry {
+                enabled: true,
+                stage_name: "TO-1".to_string(),
+                title: Some("当前单作业".to_string()),
+                is_raid: false,
+                source: CopilotEntrySource::Local { path: file },
+                origin: CopilotOrigin::Single,
+            }))
+            .unwrap();
+        (dir, cache)
+    }
+
+    fn test_copilot_cache_with_set(
+        single_count: usize,
+        set_count: usize,
+    ) -> (PathBuf, CopilotCache) {
+        let (dir, mut cache) = test_copilot_cache(single_count);
+        let entries = (0..set_count)
+            .map(|index| {
+                let file = dir.join(format!("set-{}.json", index + 1));
+                fs::write(&file, "{}").unwrap();
+                CopilotEntry {
+                    enabled: true,
+                    stage_name: format!("SET-{}", index + 1),
+                    title: Some(format!("作业集条目 {}", index + 1)),
+                    is_raid: false,
+                    source: CopilotEntrySource::Local { path: file },
+                    origin: CopilotOrigin::Set {
+                        id: 50501,
+                        name: Some("测试作业集".to_string()),
+                    },
+                }
+            })
+            .collect();
+        cache.append(entries).unwrap();
+        (dir, cache)
+    }
 
     fn test_config() -> (PathBuf, DailyConfig) {
         let unique = SystemTime::now()
@@ -2211,30 +3216,6 @@ mod tests {
         fs::write(&path, r#"{"tasks":[{"type":"StartUp"},{"type":"Award"}]}"#).unwrap();
         let config = DailyConfig::load(&path).unwrap();
         (dir, config)
-    }
-
-    #[test]
-    fn parses_supported_copilot_sources() {
-        assert!(matches!(
-            parse_copilot_source("123"),
-            Ok(CopilotSource::SingleCode(123))
-        ));
-        assert!(matches!(
-            parse_copilot_source("maa://456"),
-            Ok(CopilotSource::SingleCode(456))
-        ));
-        assert!(matches!(
-            parse_copilot_source("prts://789"),
-            Ok(CopilotSource::SingleCode(789))
-        ));
-        assert!(matches!(
-            parse_copilot_source("maa://42s"),
-            Ok(CopilotSource::SetCode(42))
-        ));
-        assert!(matches!(
-            parse_copilot_source("./plan.json"),
-            Ok(CopilotSource::Local(_))
-        ));
     }
 
     #[test]
@@ -2272,6 +3253,622 @@ mod tests {
 
         assert!(app.apply_config(|config| config.toggle_task(0).map(|_| ())));
         assert!(!app.last_failed);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn current_single_preserves_and_switches_both_modes() {
+        let (dir, cache) = test_copilot_cache(0);
+        let files = cache.files_dir().to_path_buf();
+        let path = dir.join("both.json");
+        fs::write(
+            &path,
+            r#"{"stage_name":"TO-1","difficulty":3,"doc":{"title":"双模式"}}"#,
+        )
+        .unwrap();
+        let report =
+            import_source(path.to_str().unwrap(), ImportKind::Single, &files, |_| {}).unwrap();
+        assert_eq!(
+            report
+                .entries
+                .iter()
+                .map(|entry| entry.is_raid)
+                .collect::<Vec<_>>(),
+            vec![false, true]
+        );
+        let mut app = App::new();
+        app.copilot_cache = Some(cache);
+
+        app.finish_copilot_import(ImportDestination::CurrentSingle, report);
+
+        let cache = app.copilot_cache.as_ref().unwrap();
+        assert_eq!(
+            cache.current_single_supported_modes().unwrap(),
+            (true, true)
+        );
+        assert!(!cache.current_single().unwrap().is_raid);
+        assert_eq!(cache.entries_len(), 0);
+
+        app.handle_single_copilot_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(
+            app.copilot_cache
+                .as_ref()
+                .unwrap()
+                .current_single()
+                .unwrap()
+                .is_raid
+        );
+        let command = app.current_single_copilot_command().unwrap();
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|args| args == ["--raid", "raid"])
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn input_clear_and_batch_import_type_switch_keep_text() {
+        let mut app = App::new();
+        app.input = Some(InputDialog {
+            title: "添加作业集  |  → 添加单个作业".to_string(),
+            value: "prts://123".to_string(),
+            target: InputTarget::CopilotAdd {
+                kind: ImportKind::Set,
+                destination: ImportDestination::Batch,
+            },
+        });
+
+        app.handle_input_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.input.as_ref().unwrap().value, "prts://123");
+        assert!(matches!(
+            app.input.as_ref().map(|input| &input.target),
+            Some(InputTarget::CopilotAdd {
+                kind: ImportKind::Single,
+                destination: ImportDestination::Batch,
+            })
+        ));
+        app.handle_input_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(app.input.as_ref().unwrap().value.is_empty());
+        app.handle_input_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(matches!(
+            app.input.as_ref().map(|input| &input.target),
+            Some(InputTarget::CopilotAdd {
+                kind: ImportKind::Set,
+                destination: ImportDestination::Batch,
+            })
+        ));
+    }
+
+    #[test]
+    fn batch_single_import_appends_normal_then_raid_at_end() {
+        let (dir, cache) = test_current_single_cache();
+        let files = cache.files_dir().to_path_buf();
+        let existing_path = dir.join("existing.json");
+        fs::write(&existing_path, "{}").unwrap();
+        let mut cache = cache;
+        cache
+            .append(vec![CopilotEntry {
+                enabled: true,
+                stage_name: "OLD-1".to_string(),
+                title: None,
+                is_raid: false,
+                source: CopilotEntrySource::Local {
+                    path: existing_path,
+                },
+                origin: CopilotOrigin::Set {
+                    id: 1,
+                    name: Some("原列表".to_string()),
+                },
+            }])
+            .unwrap();
+        let path = dir.join("both.json");
+        fs::write(
+            &path,
+            r#"{"stage_name":"TO-1","difficulty":3,"doc":{"title":"双模式"}}"#,
+        )
+        .unwrap();
+        let report =
+            import_source(path.to_str().unwrap(), ImportKind::Single, &files, |_| {}).unwrap();
+        let mut app = App::new();
+        app.copilot_cache = Some(cache);
+
+        app.finish_copilot_import(ImportDestination::Batch, report);
+
+        let cache = app.copilot_cache.as_ref().unwrap();
+        assert_eq!(cache.entries_len(), 3);
+        assert_eq!(cache.entry(0).unwrap().stage_name, "OLD-1");
+        assert_eq!(
+            cache
+                .entries()
+                .iter()
+                .map(|entry| (entry.stage_name.as_str(), entry.is_raid))
+                .collect::<Vec<_>>(),
+            vec![("OLD-1", false), ("TO-1", false), ("TO-1", true)]
+        );
+        assert!(cache.current_single().is_some());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn batch_toggle_all_and_clear_follow_requested_rules() {
+        let (dir, mut cache) = test_copilot_cache(3);
+        let single_path = dir.join("current.json");
+        fs::write(&single_path, "{}").unwrap();
+        cache
+            .replace_current_single(Some(CopilotEntry {
+                enabled: true,
+                stage_name: "CURRENT-1".to_string(),
+                title: None,
+                is_raid: false,
+                source: CopilotEntrySource::Local { path: single_path },
+                origin: CopilotOrigin::Single,
+            }))
+            .unwrap();
+        cache.toggle(1).unwrap();
+        let mut app = App::new();
+        app.copilot_cache = Some(cache);
+        app.copilot_section_idx = 1;
+
+        app.handle_copilot_list_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert_eq!(app.copilot_cache.as_ref().unwrap().enabled_count(), 0);
+        app.handle_copilot_list_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert_eq!(app.copilot_cache.as_ref().unwrap().enabled_count(), 3);
+        app.handle_copilot_list_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(matches!(
+            app.confirm.as_ref().map(|confirm| &confirm.target),
+            Some(ConfirmTarget::ClearCopilotEntries)
+        ));
+        app.handle_confirm_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.copilot_cache.as_ref().unwrap().entries_len(), 0);
+        assert!(
+            app.copilot_cache
+                .as_ref()
+                .unwrap()
+                .current_single()
+                .is_some()
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn option_fields_display_labels_and_preserve_unknown_values() {
+        let series = task_fields("Fight", false)
+            .into_iter()
+            .find(|field| field.key == "series")
+            .unwrap();
+        let drones = task_fields("Infrast", false)
+            .into_iter()
+            .find(|field| field.key == "drones")
+            .unwrap();
+        let mode = task_fields("Infrast", false)
+            .into_iter()
+            .find(|field| field.key == "mode")
+            .unwrap();
+        let formation = task_fields("Copilot", true)
+            .into_iter()
+            .find(|field| field.key == "formation_index")
+            .unwrap();
+        let facility = task_fields("Infrast", false)
+            .into_iter()
+            .find(|field| field.key == "facility")
+            .unwrap();
+
+        assert_eq!(series.display_value(&FieldValue::Integer(0)), "AUTO");
+        assert_eq!(drones.display_value(&string("Money")), "贸易站：龙门币");
+        assert_eq!(mode.display_value(&FieldValue::Integer(0)), "默认模式");
+        assert_eq!(formation.display_value(&FieldValue::Integer(0)), "当前编队");
+        assert_eq!(
+            facility.display_value(&FieldValue::StringArray(vec![
+                "Mfg".into(),
+                "Unknown".into()
+            ])),
+            "制造站, Unknown"
+        );
+        assert_eq!(drones.display_value(&string("Custom")), "Custom");
+        assert!(validate_field_value("series", &FieldValue::Integer(7)).is_err());
+        assert_eq!(
+            series_options()
+                .into_iter()
+                .filter_map(|option| match option.value {
+                    FieldValue::Integer(value) => Some(value),
+                    _ => None,
+                })
+                .max(),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn copilot_tabs_use_contextual_add_and_real_indices() {
+        let (dir, cache) = test_copilot_cache_with_set(2, 2);
+        let mut app = App::new();
+        app.copilot_cache = Some(cache);
+        app.screen = Screen::Copilot;
+
+        app.handle_single_copilot_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(matches!(
+            app.input.as_ref().map(|dialog| &dialog.target),
+            Some(InputTarget::CopilotAdd {
+                kind: ImportKind::Single,
+                destination: ImportDestination::CurrentSingle,
+            })
+        ));
+        app.input = None;
+
+        app.copilot_section_idx = 1;
+        app.copilot_idx = 0;
+        app.handle_copilot_list_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(matches!(
+            app.input.as_ref().map(|dialog| &dialog.target),
+            Some(InputTarget::CopilotAdd {
+                kind: ImportKind::Set,
+                destination: ImportDestination::Batch,
+            })
+        ));
+        app.input = None;
+
+        app.handle_copilot_list_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(
+            !app.copilot_cache
+                .as_ref()
+                .unwrap()
+                .entry(0)
+                .unwrap()
+                .enabled
+        );
+        assert!(
+            app.copilot_cache
+                .as_ref()
+                .unwrap()
+                .entry(1)
+                .unwrap()
+                .enabled
+        );
+
+        app.handle_copilot_list_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+        assert_eq!(app.copilot_idx, 1);
+        assert_eq!(
+            app.copilot_cache
+                .as_ref()
+                .unwrap()
+                .entry(0)
+                .unwrap()
+                .stage_name,
+            "TO-2"
+        );
+        assert_eq!(
+            app.copilot_cache
+                .as_ref()
+                .unwrap()
+                .entry(1)
+                .unwrap()
+                .stage_name,
+            "TO-1"
+        );
+
+        app.handle_copilot_list_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(matches!(
+            app.confirm.as_ref().map(|dialog| &dialog.target),
+            Some(ConfirmTarget::DeleteCopilot(1))
+        ));
+        app.handle_confirm_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(app.copilot_cache.as_ref().unwrap().len(), 3);
+        assert_eq!(app.copilot_idx, 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn copilot_tab_navigation_clamps_selection() {
+        let (dir, cache) = test_copilot_cache_with_set(0, 1);
+        let mut app = App::new();
+        app.copilot_cache = Some(cache);
+        app.screen = Screen::Copilot;
+        app.copilot_idx = 2;
+
+        app.handle_copilot_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.copilot_section(), CopilotSection::Sets);
+        assert_eq!(app.copilot_idx, 0);
+        app.handle_copilot_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.copilot_section(), CopilotSection::Settings);
+        app.handle_copilot_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.copilot_section(), CopilotSection::Singles);
+        app.handle_copilot_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.copilot_section(), CopilotSection::Singles);
+        app.handle_copilot_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.copilot_section(), CopilotSection::Sets);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn copilot_empty_set_tab_ignores_item_actions() {
+        let (dir, cache) = test_copilot_cache(0);
+        let mut app = App::new();
+        app.copilot_cache = Some(cache);
+        app.copilot_section_idx = 1;
+
+        for code in [
+            KeyCode::Char(' '),
+            KeyCode::Char('d'),
+            KeyCode::Char('i'),
+            KeyCode::Enter,
+        ] {
+            app.handle_copilot_list_key(KeyEvent::new(code, KeyModifiers::NONE));
+        }
+
+        assert!(app.confirm.is_none());
+        assert!(app.copilot_detail.is_none());
+        assert_eq!(app.phase, TaskPhase::Idle);
+        assert_eq!(app.copilot_cache.as_ref().unwrap().len(), 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn copilot_detail_reads_operator_requirements_and_notes() {
+        let (dir, cache) = test_current_single_cache();
+        let path = cache.current_single_path().unwrap();
+        fs::write(
+            &path,
+            r#"{
+                "version": 3,
+                "stage_name": "TO-1",
+                "doc": {"title": "详情测试", "details": "第一行\n第二行"},
+                "opers": [{
+                    "name": "逻各斯",
+                    "skill": 3,
+                    "skill_usage": 1,
+                    "requirements": {"elite": 2, "skill_level": 10, "module": 4}
+                }],
+                "groups": [{
+                    "name": "替补",
+                    "opers": [{"name": "阿米娅", "skill": 2, "requirements": {"module": 1}}]
+                }],
+                "actions": [{"type": "SkillUsage", "name": "逻各斯", "skill_times": 2}]
+            }"#,
+        )
+        .unwrap();
+        let mut app = App::new();
+        app.copilot_cache = Some(cache);
+        app.screen = Screen::Copilot;
+
+        app.open_current_single_detail();
+
+        let detail = app.copilot_detail.as_ref().unwrap();
+        assert!(detail.title.starts_with("单作业详情"));
+        let text = detail.lines.join("\n");
+        assert!(text.contains("关卡名：TO-1"));
+        assert!(text.contains("逻各斯 · 技能 3"));
+        assert!(text.contains("模组 4"));
+        assert!(text.contains("替补：阿米娅（技能 2"));
+        assert!(text.contains("第一行"));
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.copilot_detail.as_ref().unwrap().scroll, 10);
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(app.copilot_detail.is_none());
+        assert_eq!(app.screen, Screen::Copilot);
+        assert!(!app.should_quit);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn set_tab_opens_set_entry_detail_title() {
+        let (dir, cache) = test_copilot_cache_with_set(0, 1);
+        let path = cache.resolved_file_path(0).unwrap();
+        fs::write(&path, r#"{"stage_name":"SET-1","opers":[]}"#).unwrap();
+        let mut app = App::new();
+        app.copilot_cache = Some(cache);
+        app.copilot_section_idx = 1;
+
+        app.handle_copilot_list_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+
+        assert!(
+            app.copilot_detail
+                .as_ref()
+                .unwrap()
+                .title
+                .starts_with("作业集条目详情")
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn selected_set_entry_also_uses_single_copilot_command() {
+        let (dir, cache) = test_copilot_cache_with_set(0, 1);
+        let mut app = App::new();
+        app.copilot_cache = Some(cache);
+        app.copilot_section_idx = 1;
+
+        let command = app.selected_copilot_command().unwrap();
+
+        assert_eq!(command.args[0], "copilot");
+        assert!(command.args[1].contains("set-1.json"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn selected_copilot_command_uses_item_difficulty_without_toggling_it() {
+        let (dir, mut cache) = test_copilot_cache(0);
+        let file = dir.join("raid.json");
+        fs::write(&file, "{}").unwrap();
+        cache
+            .replace_current_single(Some(CopilotEntry {
+                enabled: true,
+                stage_name: "TO-1".to_string(),
+                title: None,
+                is_raid: true,
+                source: CopilotEntrySource::Local { path: file },
+                origin: CopilotOrigin::Single,
+            }))
+            .unwrap();
+        let mut app = App::new();
+        app.copilot_cache = Some(cache);
+        app.copilot.formation = true;
+        app.copilot.loop_times = 3;
+        let command = app.current_single_copilot_command().unwrap();
+
+        assert_eq!(command.args[0], "copilot");
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|args| args == ["--raid", "raid"])
+        );
+        assert!(command.args.iter().any(|arg| arg == "--formation"));
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|args| args == ["--loop-times", "3"])
+        );
+        assert!(
+            app.copilot_cache
+                .as_ref()
+                .unwrap()
+                .current_single()
+                .is_some()
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn batch_task_keeps_cross_tab_enabled_order() {
+        let (dir, mut cache) = test_copilot_cache_with_set(2, 2);
+        cache.toggle(1).unwrap();
+        let options = CopilotRunOptions {
+            formation_index: 0,
+            use_sanity_potion: false,
+            add_trust: false,
+            ignore_requirements: false,
+            support_unit_usage: 0,
+            support_unit_name: String::new(),
+        };
+
+        let indices = cache.enabled_indices();
+        let task =
+            crate::copilot::write_batch_task_in(&cache, indices.clone(), &options, &dir).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&task.path).unwrap()).unwrap();
+        let stages = value
+            .pointer("/tasks/0/params/copilot_list")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["stage_name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(indices, vec![0, 2, 3]);
+        assert_eq!(stages, vec!["TO-1", "SET-1", "SET-2"]);
+        remove_batch_task(&task.path);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn batch_progress_reports_current_item() {
+        let (dir, cache) = test_copilot_cache_with_set(1, 2);
+        let task_path = dir.join("batch.json");
+        fs::write(&task_path, "{}").unwrap();
+        let mut app = App::new();
+        app.copilot_cache = Some(cache);
+        app.copilot_batch = Some(CopilotBatchState::new(task_path, vec![0, 1, 2]));
+        app.copilot_batch.as_mut().unwrap().mark_success();
+
+        let (current, total, name) = app.copilot_batch_progress().unwrap();
+
+        assert_eq!((current, total), (2, 3));
+        assert!(name.contains("SET-1"));
+        app.copilot_batch.as_mut().unwrap().mark_success();
+        app.copilot_batch.as_mut().unwrap().mark_success();
+        let (current, total, name) = app.copilot_batch_progress().unwrap();
+        assert_eq!((current, total), (3, 3));
+        assert!(name.contains("收尾"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn batch_failure_keeps_failed_and_remaining_entries_enabled() {
+        let (dir, cache) = test_copilot_cache(3);
+        let task_path = dir.join("batch.json");
+        fs::write(&task_path, "{}").unwrap();
+        let mut app = App::new();
+        app.copilot_cache = Some(cache);
+        app.copilot_batch = Some(CopilotBatchState::new(task_path.clone(), vec![0, 1, 2]));
+        app.active_label = "作业集自动战斗".to_string();
+
+        app.on_copilot_stage_succeeded();
+        app.on_copilot_stage_succeeded();
+        app.on_exited(Some(1), false);
+
+        let cache = app.copilot_cache.as_ref().unwrap();
+        assert!(!cache.entry(0).unwrap().enabled);
+        assert!(!cache.entry(1).unwrap().enabled);
+        assert!(cache.entry(2).unwrap().enabled);
+        assert!(!task_path.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn batch_success_reconciles_missed_progress_events() {
+        let (dir, cache) = test_copilot_cache(3);
+        let task_path = dir.join("batch.json");
+        fs::write(&task_path, "{}").unwrap();
+        let mut app = App::new();
+        app.copilot_cache = Some(cache);
+        app.copilot_batch = Some(CopilotBatchState::new(task_path, vec![0, 1, 2]));
+        app.active_label = "作业集自动战斗".to_string();
+
+        app.on_copilot_stage_succeeded();
+        app.on_exited(Some(0), false);
+
+        assert!(
+            app.copilot_cache
+                .as_ref()
+                .unwrap()
+                .entries()
+                .iter()
+                .all(|entry| !entry.enabled)
+        );
+        assert!(app.logs.iter().any(|log| log.text.contains("已补记 2 个")));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stopped_batch_only_disables_confirmed_successes() {
+        let (dir, cache) = test_copilot_cache(2);
+        let task_path = dir.join("batch.json");
+        fs::write(&task_path, "{}").unwrap();
+        let mut app = App::new();
+        app.copilot_cache = Some(cache);
+        app.copilot_batch = Some(CopilotBatchState::new(task_path, vec![0, 1]));
+        app.active_label = "作业集自动战斗".to_string();
+
+        app.on_copilot_stage_succeeded();
+        app.on_exited(None, true);
+
+        let cache = app.copilot_cache.as_ref().unwrap();
+        assert!(!cache.entry(0).unwrap().enabled);
+        assert!(cache.entry(1).unwrap().enabled);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn internal_batch_abort_remains_failed_after_process_stops() {
+        let (dir, cache) = test_copilot_cache(1);
+        let task_path = dir.join("batch.json");
+        fs::write(&task_path, "{}").unwrap();
+        let mut app = App::new();
+        app.copilot_cache = Some(cache);
+        let mut batch = CopilotBatchState::new(task_path, vec![0]);
+        batch.set_abort_error("进度监视失败".to_string());
+        app.copilot_batch = Some(batch);
+        app.active_label = "作业集自动战斗".to_string();
+
+        app.on_exited(None, true);
+
+        assert!(app.last_failed);
+        assert!(app.status_text.contains("失败"));
+        assert!(app.logs.iter().any(|log| log.text == "进度监视失败"));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2373,5 +3970,159 @@ mod tests {
             .unwrap();
         app.poll_stage_refresh();
         assert!(app.status_text.contains("热更新"));
+    }
+
+    #[test]
+    fn detects_tile_pos_outdated_errors() {
+        assert!(looks_like_outdated_resource_error(
+            "Error: Failed to find Tile-Pos file for TO-1, your resources may be outdated"
+        ));
+        assert!(looks_like_outdated_resource_error("UnsupportedLevel"));
+        assert!(!looks_like_outdated_resource_error(
+            "Hot update completed successfully"
+        ));
+        assert!(looks_like_ocr_to_as_t0_error(
+            "Error: Failed to find Tile-Pos file for T0-1, your resources may be outdated"
+        ));
+        assert!(!looks_like_ocr_to_as_t0_error(
+            "Error: Failed to find Tile-Pos file for TO-1, your resources may be outdated"
+        ));
+    }
+
+    #[test]
+    fn parses_hot_update_version_json() {
+        let version = parse_hot_update_version(
+            r#"{"activity":{"name":"直到大地变成一颗酸橙","time":1},"last_updated":"2026-08-01 16:21:34.000"}"#,
+        )
+        .unwrap();
+        assert_eq!(version.activity_name, "直到大地变成一颗酸橙");
+        assert_eq!(version.last_updated, "2026-08-01 16:21:34.000");
+        assert!(version.summary().contains("直到大地变成一颗酸橙"));
+    }
+
+    #[test]
+    fn outdated_resource_failure_appends_actionable_hint() {
+        let mut app = App::new();
+        app.active_label = "自动战斗".to_string();
+        app.push_log(
+            LogLevel::Error,
+            "Error: Failed to find Tile-Pos file for TO-1, your resources may be outdated",
+        );
+        assert!(app.saw_outdated_resource_error);
+        assert!(!app.saw_ocr_to_t0_error);
+
+        app.on_exited(Some(1), false);
+
+        assert!(
+            app.logs
+                .iter()
+                .any(|log| log.text == OUTDATED_RESOURCE_HINT)
+        );
+        assert!(app.logs.iter().all(|log| log.text != OCR_TO_T0_HINT));
+        assert!(!app.saw_outdated_resource_error);
+    }
+
+    #[test]
+    fn ocr_to_as_t0_failure_appends_core_upgrade_hint() {
+        let mut app = App::new();
+        app.active_label = "自动战斗".to_string();
+        app.push_log(
+            LogLevel::Error,
+            "Error: Failed to find Tile-Pos file for T0-1, your resources may be outdated",
+        );
+        assert!(app.saw_ocr_to_t0_error);
+        assert!(!app.saw_outdated_resource_error);
+
+        app.on_exited(Some(1), false);
+
+        assert!(app.logs.iter().any(|log| log.text == OCR_TO_T0_HINT));
+        assert!(
+            app.logs
+                .iter()
+                .all(|log| log.text != OUTDATED_RESOURCE_HINT)
+        );
+        assert!(!app.saw_ocr_to_t0_error);
+    }
+
+    #[test]
+    fn resource_update_success_warns_when_version_unchanged() {
+        let _guard = hot_update_env_lock();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("maatui-hot-update-{unique}"));
+        let version_dir = root.join("resource");
+        fs::create_dir_all(&version_dir).unwrap();
+        let version_path = version_dir.join("version.json");
+        fs::write(
+            &version_path,
+            r#"{"activity":{"name":"旧活动"},"last_updated":"2026-07-21 08:04:12.000"}"#,
+        )
+        .unwrap();
+
+        let previous = std::env::var_os("MAA_HOT_UPDATE_DIR");
+        unsafe {
+            std::env::set_var("MAA_HOT_UPDATE_DIR", &root);
+        }
+
+        let mut app = App::new();
+        app.active_label = "资源热更新".to_string();
+        app.pending_resource_check = true;
+        app.resource_version_before = read_hot_update_version();
+        app.on_exited(Some(0), false);
+
+        assert!(app.logs.iter().any(|log| {
+            log.level == LogLevel::Warn && log.text.contains("version.json 未变化")
+        }));
+        assert!(app.status_text.contains("未变化"));
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("MAA_HOT_UPDATE_DIR", value) },
+            None => unsafe { std::env::remove_var("MAA_HOT_UPDATE_DIR") },
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resource_update_success_reports_new_version() {
+        let _guard = hot_update_env_lock();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("maatui-hot-update-new-{unique}"));
+        let version_dir = root.join("resource");
+        fs::create_dir_all(&version_dir).unwrap();
+        fs::write(
+            version_dir.join("version.json"),
+            r#"{"activity":{"name":"直到大地变成一颗酸橙"},"last_updated":"2026-08-01 16:21:34.000"}"#,
+        )
+        .unwrap();
+
+        let previous = std::env::var_os("MAA_HOT_UPDATE_DIR");
+        unsafe {
+            std::env::set_var("MAA_HOT_UPDATE_DIR", &root);
+        }
+
+        let mut app = App::new();
+        app.active_label = "资源热更新".to_string();
+        app.pending_resource_check = true;
+        app.resource_version_before = Some(HotUpdateVersion {
+            activity_name: "旧活动".to_string(),
+            last_updated: "2026-07-21 08:04:12.000".to_string(),
+        });
+        app.on_exited(Some(0), false);
+
+        assert!(app.logs.iter().any(|log| {
+            log.level == LogLevel::System && log.text.contains("直到大地变成一颗酸橙")
+        }));
+        assert!(app.status_text.contains("直到大地变成一颗酸橙"));
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("MAA_HOT_UPDATE_DIR", value) },
+            None => unsafe { std::env::remove_var("MAA_HOT_UPDATE_DIR") },
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 }

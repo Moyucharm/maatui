@@ -2,8 +2,12 @@
 
 mod app;
 mod config;
+mod copilot;
+mod copilot_run;
 mod runner;
 mod stage;
+mod storage;
+mod tile_alias;
 mod ui;
 
 use std::io::{self, stdout};

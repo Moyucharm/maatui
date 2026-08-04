@@ -10,6 +10,8 @@ MaaTUI 负责调用 `maa`、编辑 `daily` 配置、展示分级日志和控制�
 
 - 通过独立运行页执行 `maa run daily -v`
 - 主菜单和配置编辑页不再挤占日志区域
+- 运行中除日志外显示当前任务进度，例如 `当前进度：[1/7] 启动游戏`
+- 进度总数按 daily 配置中的全部任务统计，包括禁用任务
 - 运行中显示明确的停止操作
 - `SIGTERM` 后超时使用 `SIGKILL` 清理整个进程组
 
@@ -51,7 +53,7 @@ ${MAA_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/maa}/maatui/copilot-set.json
 
 - **单作业**：不保留历史列表，只保存一个“当前作业”。按 `e` 或 `a` 搜索/替换作业；输入框内按 `Ctrl+U` 可快速清空。运行前必须由用户在游戏内手动打开目标准备界面，单作业模式不会自动寻找关卡；同时支持普通与突袭的作业可按 `Space` 切换本次运行模式。
 - **作业集（批量）**：保存可排序、可独立启停的有序任务列表。按 `a` 默认添加完整作业集；在输入弹窗中按 `→` 切换到“添加单个作业”，按 `←` 切回作业集，不使用大小写 `A` 区分。
-- **运行设置**：共享自动编队、助战、理智药等运行参数。
+- **运行设置**：共享自动编队、助战、理智药等运行参数，并在修改后立即原子保存，重启 MaaTUI 后继续复用。
 
 旧版缓存升级时会清空旧单作业列表并提示重新搜索；已有作业集条目的顺序、难度和启用状态保持不变。
 
@@ -75,7 +77,7 @@ ${MAA_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/maa}/maatui/copilot-set.json
 
 - 多作业强制开启自动编队
 - `loop_times` 仅用于单作业，批量模式固定每项执行一次
-- 运行控制栏实时显示当前作业及进度，例如 `[3/9] TO-3 · 作业标题`
+- 单作业、单独运行的批量条目和完整作业集都会在运行控制栏显示当前进度，例如 `当前进度：[3/9] TO-3 · 作业标题`
 - 每项识别到三星结算后立即自动停用并保存
 - 任一项失败时 MaaCore 立即中止；失败项及后续未执行项保持启用
 - 用户主动停止时，仅已经确认三星成功的项目会停用
@@ -96,8 +98,8 @@ ${MAA_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/maa}/maatui/copilot-set.json
 
 主菜单提供两个需要二次确认的手动更新入口：
 
-- **更新热更新资源**：执行 `maa hot-update --batch -v`，更新 MaaResource，不更新 MaaCore
-- **更新 Core + 基础资源**：执行 `maa update --batch -v`，按 maa-cli 已配置频道更新 MaaCore 与随包基础资源
+- **仅更新活动与导航资源**：执行 `maa hot-update --batch -v`，更新 MaaResource，不更新 MaaCore 和随包基础资源
+- **更新 MaaCore 与基础资源**：执行 `maa update --batch -v`，按 maa-cli 已配置频道更新核心运行库与随包基础资源，适合修复 OCR 或兼容性问题
 
 更新过程复用任务日志与停止控制，不会阻塞 TUI 事件循环。
 
@@ -121,7 +123,7 @@ Failed to find Tile-Pos file for T0-1, your resources may be outdated
 作业实际是 `TO-1`（如 `maa://98652`），但旧 Core（例如 6.14.x）可能把 **TO** OCR 成 **T0**。
 上游自 **MaaCore ≥ 6.16.0** 修复「直到大地变成一颗酸橙」的 TO→T0 问题。处理：
 
-1. 「更新管理」→ **更新 Core + 基础资源**（`maa update --batch -v`）
+1. 「更新管理」→ **更新 MaaCore 与基础资源**（`maa update --batch -v`）
 2. 确认 `maa version` 中 MaaCore ≥ 6.16
 3. **仅热更新资源通常不够**
 
@@ -132,7 +134,7 @@ Failed to find Tile-Pos file for TO-1, your resources may be outdated
 
 处理顺序：
 
-1. 「更新管理」→ **更新热更新资源**
+1. 「更新管理」→ **仅更新活动与导航资源**
 2. 确认日志中的活动名 / `last_updated` 已前进
 3. 用 MaaTUI 再跑一次自动战斗（会自动补齐关卡码别名）；或确认 `Arknights-Tile-Pos/TO-1.json` 存在
 4. 若仍失败，检查 `maa dir hot-update` 的 git HEAD 是否落后 remote
@@ -156,7 +158,8 @@ MaaTUI 强制使用 `MAA_LOG_PREFIX=Always` 获取可解析的日志等级，并
 ## 前置条件
 
 - 已安装并配置 `maa-cli`
-- `maa` 在 `PATH` 中
+- `maa` 在 `PATH` 中；MaaTUI 负责发现、调用和更新编排，不复制或接管 maa-cli、MaaCore 与资源文件
+- 配置、数据、日志和资源目录遵从 `maa dir ...` 及 `MAA_*` / XDG 环境变量
 - 存在 `daily` 任务（`maa list` 可确认）
 - Linux 终端（当前停止实现使用 Unix 进程组信号）
 

@@ -10,10 +10,10 @@ use std::time::Instant;
 use anyhow::Context;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
-use crate::config::{DailyConfig, FieldValue};
+use crate::config::{DailyConfig, FieldValue, TaskSummary};
 use crate::copilot::{
-    BatchTask, CopilotCache, CopilotDetail, CopilotRunOptions, ImportKind, ImportProgress,
-    ImportReport, import_source, remove_batch_task, write_batch_task,
+    BatchTask, CopilotCache, CopilotDetail, CopilotOptions, CopilotRunOptions, ImportKind,
+    ImportProgress, ImportReport, import_source, remove_batch_task, write_batch_task,
 };
 use crate::copilot_run::{BatchPosition, CopilotBatchState};
 use crate::runner::{LogLevel, RunnerEvent, RunningTask, TaskCommand};
@@ -23,7 +23,7 @@ use crate::tile_alias;
 
 const MAX_LOG_LINES: usize = 3000;
 const OUTDATED_RESOURCE_HINT: &str = "地图资源可能过旧或关卡码别名缺失：请先热更新资源；MaaTUI 会在启动自动战斗时尝试为 overview 中的关卡码生成 Tile-Pos 别名。若仍失败，检查 `maa dir hot-update` 的 git HEAD 是否落后 remote";
-const OCR_TO_T0_HINT: &str = "关卡码疑似 OCR 将 TO 识别为 T0：请到「更新管理」执行「更新 Core + 基础资源」（需 MaaCore ≥ 6.16）；仅热更新资源通常不够";
+const OCR_TO_T0_HINT: &str = "关卡码疑似 OCR 将 TO 识别为 T0：请到「更新管理」执行「更新 MaaCore 与基础资源」（需 MaaCore ≥ 6.16）；仅热更新资源通常不够";
 pub const TASK_TYPES: [&str; 8] = [
     "StartUp",
     "Recruit",
@@ -34,6 +34,18 @@ pub const TASK_TYPES: [&str; 8] = [
     "CloseDown",
     "Copilot",
 ];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunProgress {
+    pub current: usize,
+    pub total: usize,
+    pub label: String,
+}
+
+#[derive(Debug, Clone)]
+struct DailyRunState {
+    tasks: Vec<TaskSummary>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MainMenuItem {
@@ -194,33 +206,6 @@ fn option_label(options: &[SelectOption], value: &FieldValue) -> Option<String> 
         .iter()
         .find(|option| &option.value == value)
         .map(|option| option.label.clone())
-}
-
-#[derive(Debug, Clone)]
-pub struct CopilotOptions {
-    pub formation: bool,
-    pub formation_index: i64,
-    pub use_sanity_potion: bool,
-    pub add_trust: bool,
-    pub ignore_requirements: bool,
-    pub support_unit_usage: i64,
-    pub support_unit_name: String,
-    pub loop_times: i64,
-}
-
-impl Default for CopilotOptions {
-    fn default() -> Self {
-        Self {
-            formation: false,
-            formation_index: 0,
-            use_sanity_potion: false,
-            add_trust: false,
-            ignore_requirements: false,
-            support_unit_usage: 0,
-            support_unit_name: String::new(),
-            loop_times: 1,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -391,7 +376,9 @@ pub struct App {
     pub select: Option<SelectDialog>,
     pub confirm: Option<ConfirmDialog>,
     pub copilot_detail: Option<CopilotDetailDialog>,
+    pub run_progress: Option<RunProgress>,
     task: Option<RunningTask>,
+    daily_run: Option<DailyRunState>,
     pending_resource_check: bool,
     resource_version_before: Option<HotUpdateVersion>,
     saw_outdated_resource_error: bool,
@@ -414,6 +401,10 @@ impl App {
             Ok(cache) => (Some(cache), None),
             Err(error) => (None, Some(error.to_string())),
         };
+        let copilot = copilot_cache
+            .as_ref()
+            .map(|cache| cache.settings().clone())
+            .unwrap_or_default();
         let migrated_single_reset = copilot_cache
             .as_ref()
             .is_some_and(CopilotCache::migrated_single_reset);
@@ -448,7 +439,7 @@ impl App {
             last_failed: false,
             config,
             config_error,
-            copilot: CopilotOptions::default(),
+            copilot,
             copilot_cache,
             copilot_error,
             current_single_supported_modes,
@@ -459,7 +450,9 @@ impl App {
             select: None,
             confirm: None,
             copilot_detail: None,
+            run_progress: None,
             task: None,
+            daily_run: None,
             pending_resource_check: false,
             resource_version_before: None,
             saw_outdated_resource_error: false,
@@ -510,6 +503,10 @@ impl App {
     fn clamp_copilot_selection(&mut self) {
         let len = self.copilot_visible_indices().len();
         self.copilot_idx = self.copilot_idx.min(len.saturating_sub(1));
+    }
+
+    pub fn current_run_progress(&self) -> Option<&RunProgress> {
+        self.run_progress.as_ref()
     }
 
     pub fn copilot_batch_progress(&self) -> Option<(usize, usize, String)> {
@@ -1039,6 +1036,23 @@ impl App {
         }
     }
 
+    fn save_copilot_settings(&mut self) {
+        let result = self
+            .copilot_cache
+            .as_mut()
+            .context("作业缓存未加载")
+            .and_then(|cache| cache.set_settings(self.copilot.clone()));
+        if let Err(error) = result {
+            if let Some(cache) = self.copilot_cache.as_ref() {
+                self.copilot = cache.settings().clone();
+            }
+            self.status_error(format!("保存自动战斗设置失败: {error}"));
+        } else {
+            self.last_failed = false;
+            self.status_text = "自动战斗运行设置已保存".to_string();
+        }
+    }
+
     fn handle_copilot_settings_key(&mut self, key: KeyEvent) {
         const ROWS: usize = 8;
         match key.code {
@@ -1051,7 +1065,10 @@ impl App {
             }
             KeyCode::Char('r') => self.start_copilot_batch(),
             KeyCode::Enter | KeyCode::Char('e') => match self.copilot_settings_idx {
-                0 => self.copilot.formation = !self.copilot.formation,
+                0 => {
+                    self.copilot.formation = !self.copilot.formation;
+                    self.save_copilot_settings();
+                }
                 1 => self.open_select(
                     "编队编号".to_string(),
                     FieldValue::Integer(self.copilot.formation_index),
@@ -1059,9 +1076,18 @@ impl App {
                     false,
                     InputTarget::CopilotNumber(CopilotNumberField::FormationIndex),
                 ),
-                2 => self.copilot.use_sanity_potion = !self.copilot.use_sanity_potion,
-                3 => self.copilot.add_trust = !self.copilot.add_trust,
-                4 => self.copilot.ignore_requirements = !self.copilot.ignore_requirements,
+                2 => {
+                    self.copilot.use_sanity_potion = !self.copilot.use_sanity_potion;
+                    self.save_copilot_settings();
+                }
+                3 => {
+                    self.copilot.add_trust = !self.copilot.add_trust;
+                    self.save_copilot_settings();
+                }
+                4 => {
+                    self.copilot.ignore_requirements = !self.copilot.ignore_requirements;
+                    self.save_copilot_settings();
+                }
                 5 => self.open_select(
                     "助战模式".to_string(),
                     FieldValue::Integer(self.copilot.support_unit_usage),
@@ -1168,11 +1194,11 @@ impl App {
             KeyCode::Enter => {
                 let (message, command) = match self.update_idx {
                     0 => (
-                        "确认联网更新 MaaResource 热更新资源？",
+                        "确认执行 `maa hot-update --batch -v`？\n仅更新活动与导航资源（MaaResource），不更新 MaaCore 和基础资源。",
                         TaskCommand::resource_update(),
                     ),
                     1 => (
-                        "确认更新 MaaCore 与随包基础资源？",
+                        "确认执行 `maa update --batch -v`？\n将按已配置频道更新 MaaCore 与随包基础资源，适合修复 OCR/兼容性问题。",
                         TaskCommand::core_update(),
                     ),
                     _ => return,
@@ -1524,6 +1550,7 @@ impl App {
                 .and_then(|value| self.set_copilot_number(field, value)),
             InputTarget::CopilotText(CopilotTextField::SupportName) => {
                 self.copilot.support_unit_name = dialog.value.trim().to_string();
+                self.save_copilot_settings();
                 Ok(())
             }
         };
@@ -1545,6 +1572,7 @@ impl App {
             CopilotNumberField::SupportUsage => self.copilot.support_unit_usage = value,
             CopilotNumberField::LoopTimes => self.copilot.loop_times = value,
         }
+        self.save_copilot_settings();
         Ok(())
     }
 
@@ -2001,6 +2029,14 @@ impl App {
     }
 
     fn start_current_single_copilot(&mut self) {
+        let progress = self.copilot_cache.as_ref().and_then(|cache| {
+            let entry = cache.current_single()?;
+            Some(RunProgress {
+                current: 1,
+                total: self.copilot.loop_times.max(1) as usize,
+                label: format!("{} · {}", entry.stage_name, entry.display_name()),
+            })
+        });
         let command = match self.current_single_copilot_command() {
             Ok(command) => command,
             Err(error) => {
@@ -2009,6 +2045,7 @@ impl App {
             }
         };
         self.ensure_tile_pos_aliases();
+        self.run_progress = progress;
         self.start_command(command);
     }
 
@@ -2022,6 +2059,14 @@ impl App {
     }
 
     fn start_selected_copilot(&mut self) {
+        let progress = self.selected_copilot_index().and_then(|index| {
+            let entry = self.copilot_cache.as_ref()?.entry(index)?;
+            Some(RunProgress {
+                current: 1,
+                total: self.copilot.loop_times.max(1) as usize,
+                label: format!("{} · {}", entry.stage_name, entry.display_name()),
+            })
+        });
         let command = match self.selected_copilot_command() {
             Ok(command) => command,
             Err(error) => {
@@ -2030,6 +2075,7 @@ impl App {
             }
         };
         self.ensure_tile_pos_aliases();
+        self.run_progress = progress;
         self.start_command(command);
     }
 
@@ -2095,6 +2141,11 @@ impl App {
                 .map(|entry| format!("{} · {}", entry.stage_name, entry.display_name()))
                 .unwrap_or_else(|| "未知作业".to_string());
             self.status_text = format!("作业集运行中 · 1/{total} · {current_name}");
+            self.run_progress = Some(RunProgress {
+                current: 1,
+                total,
+                label: current_name,
+            });
             self.copilot_batch = Some(CopilotBatchState::new(path, indices));
         } else {
             remove_batch_task(&path);
@@ -2147,6 +2198,20 @@ impl App {
         self.last_failed = false;
         self.saw_outdated_resource_error = false;
         self.saw_ocr_to_t0_error = false;
+        if command.track_daily_progress {
+            let tasks = self
+                .config
+                .as_ref()
+                .map(DailyConfig::task_summaries)
+                .unwrap_or_default();
+            let total = tasks.len();
+            self.run_progress = Some(RunProgress {
+                current: 0,
+                total,
+                label: "等待任务开始".to_string(),
+            });
+            self.daily_run = Some(DailyRunState { tasks });
+        }
         self.pending_resource_check = is_resource_update_command(&command);
         self.resource_version_before = if self.pending_resource_check {
             read_hot_update_version()
@@ -2172,6 +2237,8 @@ impl App {
                 self.push_log(LogLevel::Error, error);
                 self.status_text = "启动失败".to_string();
                 self.last_failed = true;
+                self.run_progress = None;
+                self.daily_run = None;
                 false
             }
         }
@@ -2210,9 +2277,12 @@ impl App {
         for event in events {
             match event {
                 RunnerEvent::Line { level, text } => self.push_log(level, text),
+                RunnerEvent::DailyTaskStarted { task_id, taskchain } => {
+                    self.on_daily_task_started(task_id, &taskchain)
+                }
                 RunnerEvent::CopilotStageSucceeded => self.on_copilot_stage_succeeded(),
-                RunnerEvent::CopilotProgressFailed(error) => {
-                    let message = format!("读取 MaaCore 作业进度失败，已停止批次: {error}");
+                RunnerEvent::ProgressFailed(error) => {
+                    let message = format!("读取 MaaCore 运行进度失败，已停止任务: {error}");
                     if let Some(batch) = self.copilot_batch.as_mut() {
                         batch.set_abort_error(message.clone());
                     }
@@ -2266,7 +2336,44 @@ impl App {
         }
     }
 
+    fn on_daily_task_started(&mut self, task_id: usize, taskchain: &str) {
+        let Some(state) = self.daily_run.as_ref() else {
+            return;
+        };
+        let total = state.tasks.len();
+        let index = task_id.saturating_sub(1);
+        let (current, label, mismatch) = state.tasks.get(index).map_or_else(
+            || {
+                (
+                    task_id.min(total),
+                    task_type_label(taskchain).to_string(),
+                    true,
+                )
+            },
+            |task| (task_id, task.name.clone(), task.task_type != taskchain),
+        );
+        self.run_progress = Some(RunProgress {
+            current,
+            total,
+            label,
+        });
+        if mismatch {
+            self.push_log(
+                LogLevel::Warn,
+                format!("每日任务进度映射不一致: taskid={task_id}, taskchain={taskchain}"),
+            );
+        }
+    }
+
     fn on_copilot_stage_succeeded(&mut self) {
+        if self.copilot_batch.is_none() {
+            if let Some(progress) = self.run_progress.as_mut()
+                && progress.current < progress.total
+            {
+                progress.current += 1;
+            }
+            return;
+        }
         let Some(completion) = self
             .copilot_batch
             .as_ref()
@@ -2308,8 +2415,17 @@ impl App {
                         .and_then(|index| self.copilot_cache.as_ref()?.entry(index))
                         .map(|entry| format!("{} · {}", entry.stage_name, entry.display_name()))
                         .unwrap_or_else(|| "未知作业".to_string());
+                    self.run_progress = Some(RunProgress {
+                        current: completed + 1,
+                        total,
+                        label: next.clone(),
+                    });
                     format!("作业集运行中 · {}/{total} · {next}", completed + 1)
                 } else {
+                    if let Some(progress) = self.run_progress.as_mut() {
+                        progress.current = total;
+                        progress.label = "全部作业已完成，正在收尾".to_string();
+                    }
                     format!("作业集运行中 · {total}/{total} · 正在收尾")
                 };
             }
@@ -2395,6 +2511,8 @@ impl App {
         self.phase = TaskPhase::Idle;
         self.started_at = None;
         self.active_label.clear();
+        self.run_progress = None;
+        self.daily_run = None;
         self.saw_outdated_resource_error = false;
         self.saw_ocr_to_t0_error = false;
         self.auto_scroll = true;
@@ -3065,6 +3183,20 @@ fn integers(values: &[i64]) -> FieldValue {
     FieldValue::IntegerArray(values.to_vec())
 }
 
+fn task_type_label(task_type: &str) -> &str {
+    match task_type {
+        "StartUp" => "启动游戏",
+        "Recruit" => "公开招募",
+        "Fight" => "刷理智",
+        "Infrast" => "基建换班",
+        "Mall" => "信用商店",
+        "Award" => "领取奖励",
+        "CloseDown" => "关闭游戏",
+        "Copilot" => "自动战斗",
+        _ => task_type,
+    }
+}
+
 fn is_resource_update_command(command: &TaskCommand) -> bool {
     command.args.first().is_some_and(|arg| arg == "hot-update")
         || command.label.contains("资源热更新")
@@ -3216,6 +3348,36 @@ mod tests {
         fs::write(&path, r#"{"tasks":[{"type":"StartUp"},{"type":"Award"}]}"#).unwrap();
         let config = DailyConfig::load(&path).unwrap();
         (dir, config)
+    }
+
+    #[test]
+    fn daily_progress_uses_config_order_and_total() {
+        let mut app = App::new();
+        app.daily_run = Some(DailyRunState {
+            tasks: vec![
+                TaskSummary {
+                    name: "启动游戏".to_string(),
+                    task_type: "StartUp".to_string(),
+                    enabled: true,
+                },
+                TaskSummary {
+                    name: "关闭游戏".to_string(),
+                    task_type: "CloseDown".to_string(),
+                    enabled: false,
+                },
+            ],
+        });
+
+        app.on_daily_task_started(2, "CloseDown");
+
+        assert_eq!(
+            app.run_progress,
+            Some(RunProgress {
+                current: 2,
+                total: 2,
+                label: "关闭游戏".to_string(),
+            })
+        );
     }
 
     #[test]

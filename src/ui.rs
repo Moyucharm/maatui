@@ -568,12 +568,12 @@ fn draw_copilot_settings(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_update(frame: &mut Frame, app: &App, area: Rect) {
     let rows = [
         (
-            "更新热更新资源",
-            "maa hot-update --batch -v · 不更新 Core".to_string(),
+            "仅更新活动与导航资源",
+            "热更新 MaaResource；不更新 MaaCore 和基础资源".to_string(),
         ),
         (
-            "更新 Core + 基础资源",
-            "maa update --batch -v · 使用已配置频道".to_string(),
+            "更新 MaaCore 与基础资源",
+            "更新核心运行库及随包资源；适合 OCR/兼容性修复".to_string(),
         ),
     ];
     let items = rows
@@ -593,7 +593,15 @@ fn draw_update(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_running_control(frame: &mut Frame, app: &App, area: Rect) {
     let label = match app.phase {
         TaskPhase::Running => {
-            if let Some((current, total, name)) = app.copilot_batch_progress() {
+            let progress = app.current_run_progress().map(|progress| {
+                format!(
+                    "当前进度：[{}/{}] {}",
+                    progress.current, progress.total, progress.label
+                )
+            });
+            if let Some(progress) = progress {
+                format!("{}  {}", app.spinner(), progress)
+            } else if let Some((current, total, name)) = app.copilot_batch_progress() {
                 format!(
                     "{}  {}  [{current}/{total}] {name}",
                     app.spinner(),
@@ -685,37 +693,87 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
-    let keys = if app.phase != TaskPhase::Idle {
-        "Enter/s 停止  PgUp/PgDn 滚动  q 停止并退出"
-    } else {
-        match app.screen {
-            Screen::Main => "↑↓/jk 选择  Enter 确认  q 退出",
-            Screen::Daily => "↑↓/jk 选择  Enter 运行/配置  r 运行  c 配置  Esc 返回",
-            Screen::Config => {
-                "Space 开关  Enter/e 编辑  a 新增  d 删除  Shift+↑↓ 移动  r 重载  Esc 返回"
-            }
-            Screen::AddTask => "↑↓ 选择类型  Enter 新增并编辑  Esc 返回",
-            Screen::TaskEdit => "←→/hl 切换层级  ↑↓ 选择  Enter/e 编辑  v 创建活动变体  Esc 返回",
-            Screen::VariantList => "a 新增  d 删除  Shift+↑↓ 移动  Enter 编辑  Esc 返回",
-            Screen::VariantEdit => "↑↓ 选择  Enter 编辑  Esc 返回",
-            Screen::Copilot => match app.copilot_section() {
-                CopilotSection::Singles => {
-                    "e/a 搜索或替换  Space 切换双模式难度  i 查看详情  Enter 运行  Tab 切页签"
-                }
-                CopilotSection::Sets => {
-                    "↑↓ 选择  Space 启停  a 添加（←→切换类型）  t 全部启停  c 清空  i 详情  d 删除  Shift+↑↓ 移动  Enter 单独运行  r 批量运行  Tab 切页签"
-                }
-                CopilotSection::Settings => {
-                    "↑↓ 选择  Enter/e 编辑  r 批量运行  Tab/←→ 作业页签  Esc 返回"
-                }
-            },
-            Screen::Update => "↑↓/jk 选择  Enter 更新  Esc 返回",
-        }
-    };
+    let available = area.width.saturating_sub(1) as usize;
+    let keys = footer_keys(app, available);
     frame.render_widget(
         Paragraph::new(Span::styled(format!(" {keys}"), Style::default().fg(MUTED))),
         area,
     );
+}
+
+fn footer_keys(app: &App, width: usize) -> String {
+    let (full, medium, compact) = if app.phase != TaskPhase::Idle {
+        (
+            "Enter/s 停止  PgUp/PgDn 滚动  q 停止并退出",
+            "Enter/s 停止  PgUp/PgDn 滚动",
+            "Enter/s 停止",
+        )
+    } else {
+        match app.screen {
+            Screen::Main => (
+                "↑↓/jk 选择  Enter 确认  q 退出",
+                "↑↓ 选择  Enter 确认  q 退出",
+                "↑↓ Enter q",
+            ),
+            Screen::Daily => (
+                "↑↓/jk 选择  Enter 运行/配置  r 运行  c 配置  Esc 返回",
+                "↑↓ 选择  Enter 确认  r 运行  Esc 返回",
+                "↑↓ Enter r Esc",
+            ),
+            Screen::Config => (
+                "Space 开关  Enter/e 编辑  a 新增  d 删除  Shift+↑↓ 移动  r 重载  Esc 返回",
+                "Space 开关  Enter 编辑  a 新增  d 删除  Esc 返回",
+                "↑↓ Enter Space Esc",
+            ),
+            Screen::AddTask => (
+                "↑↓ 选择类型  Enter 新增并编辑  Esc 返回",
+                "↑↓ 选择  Enter 新增  Esc 返回",
+                "↑↓ Enter Esc",
+            ),
+            Screen::TaskEdit => (
+                "←→/hl 切换层级  ↑↓ 选择  Enter/e 编辑  v 创建活动变体  Esc 返回",
+                "←→ 切层  ↑↓ 选择  Enter 编辑  Esc 返回",
+                "←→ ↑↓ Enter Esc",
+            ),
+            Screen::VariantList => (
+                "a 新增  d 删除  Shift+↑↓ 移动  Enter 编辑  Esc 返回",
+                "↑↓ 选择  Enter 编辑  a 新增  Esc 返回",
+                "↑↓ Enter a Esc",
+            ),
+            Screen::VariantEdit => (
+                "↑↓ 选择  Enter 编辑  Esc 返回",
+                "↑↓ 选择  Enter 编辑  Esc 返回",
+                "↑↓ Enter Esc",
+            ),
+            Screen::Copilot => match app.copilot_section() {
+                CopilotSection::Singles => (
+                    "e/a 搜索或替换  Space 切换双模式难度  i 查看详情  Enter 运行  Tab 切页签  Esc 返回",
+                    "e 搜索  Space 难度  Enter 运行  Tab 切页  Esc 返回",
+                    "e Enter Tab Esc",
+                ),
+                CopilotSection::Sets => (
+                    "↑↓ 选择  Space 启停  a 添加  t 全部启停  c 清空  i 详情  d 删除  Shift+↑↓ 移动  Enter 单独运行  r 批量运行  Tab 切页签  Esc 返回",
+                    "↑↓ 选择  Space 启停  Enter 单跑  r 批量  Tab 切页  Esc 返回",
+                    "↑↓ Space Enter r Tab Esc",
+                ),
+                CopilotSection::Settings => (
+                    "↑↓ 选择  Enter/e 编辑  r 批量运行  Tab/←→ 作业页签  Esc 返回",
+                    "↑↓ 选择  Enter 编辑  r 批量  Tab 切页  Esc 返回",
+                    "↑↓ Enter r Tab Esc",
+                ),
+            },
+            Screen::Update => (
+                "↑↓/jk 选择  Enter 更新  Esc 返回",
+                "↑↓ 选择  Enter 更新  Esc 返回",
+                "↑↓ Enter Esc",
+            ),
+        }
+    };
+    [full, medium, compact]
+        .into_iter()
+        .find(|text| text.width() <= width)
+        .map(str::to_string)
+        .unwrap_or_else(|| truncate_display_width(compact, width))
 }
 
 fn draw_input_dialog(frame: &mut Frame, area: Rect, title: &str, value: &str) {
@@ -1049,6 +1107,18 @@ mod tests {
         assert_eq!(truncate_display_width("short", 8), "short");
         assert_eq!(truncate_display_width("内容", 1), "…");
         assert!(truncate_display_width("长标题abcdef", 7).width() <= 7);
+    }
+
+    #[test]
+    fn copilot_footer_never_exceeds_available_width() {
+        let mut app = App::new();
+        app.screen = Screen::Copilot;
+        app.copilot_section_idx = 1;
+        for width in [8, 16, 32, 60, 120] {
+            let text = footer_keys(&app, width);
+            assert!(text.width() <= width, "width={width}, text={text}");
+        }
+        assert!(footer_keys(&app, 32).contains("Enter"));
     }
 
     #[test]

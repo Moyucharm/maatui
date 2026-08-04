@@ -11,6 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use libc::{SIGKILL, SIGTERM, kill, pid_t};
+use serde_json::Value as JsonValue;
 use strip_ansi_escapes::strip_str;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,8 +29,9 @@ pub enum LogLevel {
 #[derive(Debug, Clone)]
 pub enum RunnerEvent {
     Line { level: LogLevel, text: String },
+    DailyTaskStarted { task_id: usize, taskchain: String },
     CopilotStageSucceeded,
-    CopilotProgressFailed(String),
+    ProgressFailed(String),
     Exited { code: Option<i32>, stopped: bool },
 }
 
@@ -39,17 +41,21 @@ pub struct TaskCommand {
     pub program: String,
     pub args: Vec<String>,
     pub envs: Vec<(String, String)>,
+    pub track_daily_progress: bool,
     pub track_copilot_progress: bool,
 }
 
 impl TaskCommand {
     pub fn daily() -> Self {
-        Self::maa("每日任务", ["run", "daily", "-v"])
+        let mut command = Self::maa("每日任务", ["run", "daily", "-v"]);
+        command.track_daily_progress = true;
+        command
     }
 
     pub fn copilot(args: Vec<String>) -> Self {
         let mut command = Self::maa("自动战斗", std::iter::empty::<&str>());
         command.args = args;
+        command.track_copilot_progress = true;
         command
     }
 
@@ -77,6 +83,7 @@ impl TaskCommand {
             program: "maa".to_string(),
             args: args.into_iter().map(Into::into).collect(),
             envs: vec![("MAA_LOG_PREFIX".to_string(), "Always".to_string())],
+            track_daily_progress: false,
             track_copilot_progress: false,
         }
     }
@@ -111,10 +118,18 @@ struct CoreLogCursor {
     identity: Option<FileIdentity>,
     pid: u32,
     partial: String,
+    track_daily: bool,
+    track_copilot: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CoreProgressEvent {
+    DailyTaskStarted { task_id: usize, taskchain: String },
+    CopilotStageSucceeded,
 }
 
 impl CoreLogCursor {
-    fn prepare(program: &str) -> Result<Self, String> {
+    fn prepare(program: &str, track_daily: bool, track_copilot: bool) -> Result<Self, String> {
         let output = Command::new(program)
             .args(["dir", "log"])
             .output()
@@ -148,56 +163,61 @@ impl CoreLogCursor {
             identity,
             pid: 0,
             partial: String::new(),
+            track_daily,
+            track_copilot,
         })
     }
 
-    fn poll(&mut self) -> std::io::Result<usize> {
+    fn poll(&mut self) -> std::io::Result<Vec<CoreProgressEvent>> {
         let metadata = match fs::metadata(&self.path) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Vec::new());
+            }
             Err(error) => return Err(error),
         };
         let current_identity = FileIdentity::from_metadata(&metadata);
-        let mut success_count = 0;
+        let mut events = Vec::new();
         if self
             .identity
             .is_some_and(|identity| identity != current_identity)
             || metadata.len() < self.offset
         {
-            success_count += self.read_rotated_backup()?;
+            events.extend(self.read_rotated_backup()?);
             self.offset = 0;
             self.partial.clear();
         }
         self.identity = Some(current_identity);
-        Ok(success_count + self.read_current()?)
+        events.extend(self.read_current()?);
+        Ok(events)
     }
 
-    fn read_rotated_backup(&mut self) -> std::io::Result<usize> {
+    fn read_rotated_backup(&mut self) -> std::io::Result<Vec<CoreProgressEvent>> {
         let Some(identity) = self.identity else {
-            return Ok(0);
+            return Ok(Vec::new());
         };
         let Ok(metadata) = fs::metadata(&self.backup_path) else {
-            return Ok(0);
+            return Ok(Vec::new());
         };
         if FileIdentity::from_metadata(&metadata) != identity || metadata.len() <= self.offset {
-            return Ok(0);
+            return Ok(Vec::new());
         }
         let mut lines = Vec::new();
         self.read_from(self.backup_path.clone(), metadata.len(), &mut lines)?;
         Ok(lines
             .into_iter()
-            .filter(|line| self.is_success_line(line))
-            .count())
+            .filter_map(|line| self.parse_progress_line(&line))
+            .collect())
     }
 
-    fn read_current(&mut self) -> std::io::Result<usize> {
+    fn read_current(&mut self) -> std::io::Result<Vec<CoreProgressEvent>> {
         let len = fs::metadata(&self.path)?.len();
         let mut lines = Vec::new();
         self.read_from(self.path.clone(), len, &mut lines)?;
         Ok(lines
             .into_iter()
-            .filter(|line| self.is_success_line(line))
-            .count())
+            .filter_map(|line| self.parse_progress_line(&line))
+            .collect())
     }
 
     fn read_from(
@@ -223,12 +243,37 @@ impl CoreLogCursor {
         Ok(())
     }
 
-    fn is_success_line(&self, line: &str) -> bool {
-        line.contains(&format!("[Px{}]", self.pid))
-            && line.contains("Assistant::append_callback | SubTaskStart ")
-            && line.contains("\"taskchain\":\"Copilot\"")
-            && (line.contains("\"task\":\"StageDrops-Stars-3\"")
-                || line.contains("\"task\":\"StageDrops-Stars-Adverse\""))
+    fn parse_progress_line(&self, line: &str) -> Option<CoreProgressEvent> {
+        if !line.contains(&format!("[Px{}]", self.pid)) {
+            return None;
+        }
+        let (callback, raw_json) = line
+            .split_once("Assistant::append_callback | ")?
+            .1
+            .split_once(' ')?;
+        let payload: JsonValue = serde_json::from_str(raw_json).ok()?;
+        let taskchain = payload.get("taskchain")?.as_str()?;
+
+        if self.track_daily && callback == "TaskChainStart" {
+            let task_id = payload.get("taskid")?.as_u64()? as usize;
+            return Some(CoreProgressEvent::DailyTaskStarted {
+                task_id,
+                taskchain: taskchain.to_string(),
+            });
+        }
+        if self.track_copilot
+            && callback == "SubTaskStart"
+            && taskchain == "Copilot"
+            && payload
+                .pointer("/details/task")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|task| {
+                    matches!(task, "StageDrops-Stars-3" | "StageDrops-Stars-Adverse")
+                })
+        {
+            return Some(CoreProgressEvent::CopilotStageSucceeded);
+        }
+        None
     }
 }
 
@@ -245,9 +290,14 @@ pub struct RunningTask {
 
 impl RunningTask {
     pub fn spawn(command: &TaskCommand) -> Result<Self, String> {
-        let core_log = command
-            .track_copilot_progress
-            .then(|| CoreLogCursor::prepare(&command.program))
+        let core_log = (command.track_daily_progress || command.track_copilot_progress)
+            .then(|| {
+                CoreLogCursor::prepare(
+                    &command.program,
+                    command.track_daily_progress,
+                    command.track_copilot_progress,
+                )
+            })
             .transpose()?;
         Self::spawn_command_with_env(
             &command.program,
@@ -386,9 +436,14 @@ impl RunningTask {
             return;
         };
         match cursor.poll() {
-            Ok(count) => events.extend((0..count).map(|_| RunnerEvent::CopilotStageSucceeded)),
+            Ok(progress) => events.extend(progress.into_iter().map(|event| match event {
+                CoreProgressEvent::DailyTaskStarted { task_id, taskchain } => {
+                    RunnerEvent::DailyTaskStarted { task_id, taskchain }
+                }
+                CoreProgressEvent::CopilotStageSucceeded => RunnerEvent::CopilotStageSucceeded,
+            })),
             Err(error) => {
-                events.push(RunnerEvent::CopilotProgressFailed(error.to_string()));
+                events.push(RunnerEvent::ProgressFailed(error.to_string()));
                 self.core_log = None;
             }
         }
@@ -530,12 +585,56 @@ mod tests {
             identity: None,
             pid: 123,
             partial: String::new(),
+            track_daily: false,
+            track_copilot: true,
         };
         let success = r#"[INF][Px123][Tx1] Assistant::append_callback | SubTaskStart {"details":{"task":"StageDrops-Stars-3"},"taskchain":"Copilot"}"#;
-        assert!(cursor.is_success_line(success));
-        assert!(!cursor.is_success_line(&success.replace("Px123", "Px124")));
-        assert!(!cursor.is_success_line(&success.replace("SubTaskStart", "SubTaskCompleted")));
-        assert!(!cursor.is_success_line(&success.replace("Copilot", "Mall")));
+        assert_eq!(
+            cursor.parse_progress_line(success),
+            Some(CoreProgressEvent::CopilotStageSucceeded)
+        );
+        assert!(
+            cursor
+                .parse_progress_line(&success.replace("Px123", "Px124"))
+                .is_none()
+        );
+        assert!(
+            cursor
+                .parse_progress_line(&success.replace("SubTaskStart", "SubTaskCompleted"))
+                .is_none()
+        );
+        assert!(
+            cursor
+                .parse_progress_line(&success.replace("Copilot", "Mall"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn core_log_cursor_parses_daily_task_start_for_matching_pid() {
+        let cursor = CoreLogCursor {
+            path: PathBuf::new(),
+            backup_path: PathBuf::new(),
+            offset: 0,
+            identity: None,
+            pid: 321,
+            partial: String::new(),
+            track_daily: true,
+            track_copilot: false,
+        };
+        let line = r#"[INF][Px321][Tx1] Assistant::append_callback | TaskChainStart {"taskchain":"Fight","taskid":3}"#;
+        assert_eq!(
+            cursor.parse_progress_line(line),
+            Some(CoreProgressEvent::DailyTaskStarted {
+                task_id: 3,
+                taskchain: "Fight".to_string(),
+            })
+        );
+        assert!(
+            cursor
+                .parse_progress_line(&line.replace("Px321", "Px999"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -552,6 +651,8 @@ mod tests {
             identity: Some(FileIdentity::from_metadata(&metadata)),
             pid: 123,
             partial: String::new(),
+            track_daily: false,
+            track_copilot: true,
         };
         let success = |stage: &str| {
             format!(
@@ -565,7 +666,7 @@ mod tests {
             .unwrap()
             .write_all(success("StageDrops-Stars-3").as_bytes())
             .unwrap();
-        assert_eq!(cursor.poll().unwrap(), 1);
+        assert_eq!(cursor.poll().unwrap().len(), 1);
 
         OpenOptions::new()
             .append(true)
@@ -576,7 +677,7 @@ mod tests {
         fs::rename(&path, &backup_path).unwrap();
         fs::write(&path, success("StageDrops-Stars-3")).unwrap();
 
-        assert_eq!(cursor.poll().unwrap(), 2);
+        assert_eq!(cursor.poll().unwrap().len(), 2);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -605,8 +706,9 @@ mod tests {
             for event in task.poll_events() {
                 match event {
                     RunnerEvent::Line { level, text } => lines.push((level, text)),
+                    RunnerEvent::DailyTaskStarted { .. } => {}
                     RunnerEvent::CopilotStageSucceeded => {}
-                    RunnerEvent::CopilotProgressFailed(_) => {}
+                    RunnerEvent::ProgressFailed(_) => {}
                     RunnerEvent::Exited { code, stopped } => exited = Some((code, stopped)),
                 }
             }

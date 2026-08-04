@@ -176,6 +176,12 @@ impl DailyConfig {
         }
     }
 
+    pub fn task_summaries(&self) -> Vec<TaskSummary> {
+        (0..self.len())
+            .filter_map(|index| self.task_summary(index))
+            .collect()
+    }
+
     pub fn task_summary(&self, index: usize) -> Option<TaskSummary> {
         Some(TaskSummary {
             name: self.task_name(index)?,

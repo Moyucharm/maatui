@@ -12,7 +12,7 @@ use serde_json::{Value as JsonValue, json};
 use crate::storage::{atomic_write, maa_config_dir, maatui_cache_dir};
 use crate::tile_alias;
 
-const CACHE_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 4;
 const COPILOT_API: &str = "https://prts.maa.plus/copilot/get/";
 const COPILOT_SET_API: &str = "https://prts.maa.plus/set/get?id=";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -85,9 +85,50 @@ impl CopilotEntry {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CopilotOptions {
+    #[serde(default)]
+    pub formation: bool,
+    #[serde(default)]
+    pub formation_index: i64,
+    #[serde(default)]
+    pub use_sanity_potion: bool,
+    #[serde(default)]
+    pub add_trust: bool,
+    #[serde(default)]
+    pub ignore_requirements: bool,
+    #[serde(default)]
+    pub support_unit_usage: i64,
+    #[serde(default)]
+    pub support_unit_name: String,
+    #[serde(default = "default_loop_times")]
+    pub loop_times: i64,
+}
+
+const fn default_loop_times() -> i64 {
+    1
+}
+
+impl Default for CopilotOptions {
+    fn default() -> Self {
+        Self {
+            formation: false,
+            formation_index: 0,
+            use_sanity_potion: false,
+            add_trust: false,
+            ignore_requirements: false,
+            support_unit_usage: 0,
+            support_unit_name: String::new(),
+            loop_times: default_loop_times(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CopilotCacheFile {
     version: u32,
+    #[serde(default)]
+    settings: CopilotOptions,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     current_single: Option<CopilotEntry>,
     #[serde(default)]
@@ -97,6 +138,7 @@ struct CopilotCacheFile {
 pub struct CopilotCache {
     path: PathBuf,
     files_dir: PathBuf,
+    settings: CopilotOptions,
     current_single: Option<CopilotEntry>,
     entries: Vec<CopilotEntry>,
     migrated_single_reset: bool,
@@ -109,31 +151,40 @@ impl CopilotCache {
     }
 
     pub fn load(path: PathBuf, files_dir: PathBuf) -> Result<Self> {
-        let (current_single, entries, migrated_single_reset, needs_save) = if path.is_file() {
-            let raw = fs::read_to_string(&path)
-                .with_context(|| format!("读取作业列表失败: {}", path.display()))?;
-            let file: CopilotCacheFile = serde_json::from_str(&raw)
-                .with_context(|| format!("解析作业列表失败: {}", path.display()))?;
-            if !(1..=CACHE_VERSION).contains(&file.version) {
-                bail!("不支持的作业列表版本: {}", file.version);
-            }
-            if file.version < CACHE_VERSION {
-                let had_single = file.entries.iter().any(|entry| !entry.origin.is_set());
-                let entries = file
-                    .entries
-                    .into_iter()
-                    .filter(|entry| entry.origin.is_set())
-                    .collect();
-                (None, entries, had_single, true)
+        let (settings, current_single, entries, migrated_single_reset, needs_save) =
+            if path.is_file() {
+                let raw = fs::read_to_string(&path)
+                    .with_context(|| format!("读取作业列表失败: {}", path.display()))?;
+                let file: CopilotCacheFile = serde_json::from_str(&raw)
+                    .with_context(|| format!("解析作业列表失败: {}", path.display()))?;
+                if !(1..=CACHE_VERSION).contains(&file.version) {
+                    bail!("不支持的作业列表版本: {}", file.version);
+                }
+                let (current_single, entries, migrated_single_reset) = if file.version < 3 {
+                    let had_single = file.entries.iter().any(|entry| !entry.origin.is_set());
+                    let entries = file
+                        .entries
+                        .into_iter()
+                        .filter(|entry| entry.origin.is_set())
+                        .collect();
+                    (None, entries, had_single)
+                } else {
+                    (file.current_single, file.entries, false)
+                };
+                (
+                    file.settings,
+                    current_single,
+                    entries,
+                    migrated_single_reset,
+                    file.version < CACHE_VERSION,
+                )
             } else {
-                (file.current_single, file.entries, false, false)
-            }
-        } else {
-            (None, Vec::new(), false, false)
-        };
+                (CopilotOptions::default(), None, Vec::new(), false, false)
+            };
         let cache = Self {
             path,
             files_dir,
+            settings,
             current_single,
             entries,
             migrated_single_reset,
@@ -142,6 +193,19 @@ impl CopilotCache {
             cache.save().context("保存升级后的作业缓存失败")?;
         }
         Ok(cache)
+    }
+
+    pub fn settings(&self) -> &CopilotOptions {
+        &self.settings
+    }
+
+    pub fn set_settings(&mut self, settings: CopilotOptions) -> Result<()> {
+        let original = std::mem::replace(&mut self.settings, settings);
+        if let Err(error) = self.save() {
+            self.settings = original;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn files_dir(&self) -> &Path {
@@ -332,6 +396,7 @@ impl CopilotCache {
         }
         let file = CopilotCacheFile {
             version: CACHE_VERSION,
+            settings: self.settings.clone(),
             current_single: self.current_single.clone(),
             entries: self.entries.clone(),
         };
@@ -1279,6 +1344,70 @@ mod tests {
                 .iter()
                 .all(|entry| entry.origin == CopilotOrigin::Single)
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cache_persists_run_settings() {
+        let dir = temp_dir();
+        let path = dir.join("copilot-set.json");
+        let files = dir.join("files");
+        let mut cache = CopilotCache::load(path.clone(), files.clone()).unwrap();
+        cache
+            .set_settings(CopilotOptions {
+                formation: true,
+                formation_index: 2,
+                use_sanity_potion: true,
+                add_trust: true,
+                ignore_requirements: true,
+                support_unit_usage: 3,
+                support_unit_name: "能天使".to_string(),
+                loop_times: 4,
+            })
+            .unwrap();
+
+        let reloaded = CopilotCache::load(path, files).unwrap();
+        assert_eq!(reloaded.settings().formation_index, 2);
+        assert_eq!(reloaded.settings().support_unit_name, "能天使");
+        assert_eq!(reloaded.settings().loop_times, 4);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn v3_migration_preserves_current_single_and_entries() {
+        let dir = temp_dir();
+        let path = dir.join("copilot-set.json");
+        let files = dir.join("files");
+        fs::write(
+            &path,
+            r#"{
+                "version": 3,
+                "current_single": {
+                    "enabled": true,
+                    "stage_name": "TO-1",
+                    "title": "当前作业",
+                    "is_raid": false,
+                    "source": {"kind": "remote", "id": 1}
+                },
+                "entries": [{
+                    "enabled": true,
+                    "stage_name": "TO-2",
+                    "title": "批量作业",
+                    "is_raid": false,
+                    "source": {"kind": "remote", "id": 2},
+                    "origin": {"kind": "set", "id": 50501}
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        let cache = CopilotCache::load(path.clone(), files).unwrap();
+        assert_eq!(cache.current_single().unwrap().stage_name, "TO-1");
+        assert_eq!(cache.entry(0).unwrap().stage_name, "TO-2");
+        assert_eq!(cache.settings(), &CopilotOptions::default());
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(persisted["version"], CACHE_VERSION);
         fs::remove_dir_all(dir).unwrap();
     }
 

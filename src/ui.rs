@@ -8,10 +8,11 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
-    App, CopilotDetailDialog, CopilotSection, EditorSection, MainMenuItem, Screen, SelectDialog,
-    TASK_TYPES, TaskPhase, variant_fields,
+    App, CopilotDetailDialog, CopilotSection, EditorSection, InputDialog, LogScope, MainMenuItem,
+    Screen, SelectDialog, TASK_TYPES, TaskPhase, variant_fields,
 };
 use crate::runner::LogLevel;
+use crate::shortcuts::{ShortcutHint, hints as shortcut_hints_for};
 
 const ACCENT: Color = Color::Cyan;
 const MUTED: Color = Color::DarkGray;
@@ -72,7 +73,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     if let Some(input) = &app.input {
-        draw_input_dialog(frame, area, &input.title, &input.value);
+        draw_input_dialog(frame, area, input);
     }
     if let Some(select) = &app.select {
         draw_select_dialog(frame, area, select);
@@ -83,6 +84,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(detail) = app.copilot_detail.as_mut() {
         draw_copilot_detail(frame, area, detail);
     }
+    if app.shortcut_help_open {
+        draw_shortcut_help(frame, area, app);
+    }
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
@@ -92,6 +96,8 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         TaskPhase::Running => ("●", "Running", OK),
         TaskPhase::Stopping => ("●", "Stopping", WARN),
     };
+    let status_width = area.width.saturating_sub(28) as usize;
+    let status_text = truncate_display_width(&app.status_text, status_width);
     let title = Line::from(vec![
         Span::styled(
             " MaaTUI ",
@@ -105,7 +111,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw(" "),
         Span::styled(phase_label, Style::default().fg(phase_color)),
         Span::raw("  ·  "),
-        Span::styled(&app.status_text, Style::default().fg(Color::Gray)),
+        Span::styled(status_text, Style::default().fg(Color::Gray)),
     ]);
     frame.render_widget(
         Paragraph::new(title).block(
@@ -154,11 +160,11 @@ fn draw_main(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_daily(frame: &mut Frame, app: &App, area: Rect) {
     let task_count = app.config.as_ref().map_or(0, |config| config.len());
-    let config_status = app
-        .config
-        .as_ref()
-        .map(|config| config.path().display().to_string())
-        .unwrap_or_else(|| "daily 配置未加载".to_string());
+    let config_status = if app.config.is_some() {
+        "已加载"
+    } else {
+        "未加载"
+    };
     let rows = [
         ("开始运行", "maa run daily -v".to_string()),
         ("配置管理", format!("{task_count} 个任务 · {config_status}")),
@@ -168,7 +174,7 @@ fn draw_daily(frame: &mut Frame, app: &App, area: Rect) {
         .enumerate()
         .map(|(index, (label, value))| field_item(index == app.daily_idx, label, value))
         .collect();
-    render_list(frame, area, " 每日任务 · 独立运行页 ", items, app.daily_idx);
+    render_list(frame, area, " 每日任务 ", items, app.daily_idx);
 }
 
 fn draw_config(frame: &mut Frame, app: &App, area: Rect) {
@@ -202,8 +208,7 @@ fn draw_config(frame: &mut Frame, app: &App, area: Rect) {
             ]))
         })
         .collect();
-    let title = format!(" daily 配置 · {} ", config.path().display());
-    render_list(frame, area, &title, items, app.config_idx);
+    render_list(frame, area, " 配置管理 ", items, app.config_idx);
 }
 
 fn draw_add_task(frame: &mut Frame, app: &App, area: Rect) {
@@ -279,20 +284,10 @@ fn draw_task_edit(frame: &mut Frame, app: &App, area: Rect) {
             let value = app
                 .task_field_value(field)
                 .unwrap_or_else(|| field.default.clone());
-            field_item(
-                selected,
-                field.label,
-                &app.task_field_display(field, &value),
-            )
+            field_item(selected, field.label, &app.field_display(field, &value))
         })
         .collect();
-    render_list(
-        frame,
-        chunks[1],
-        " 字段（Enter 编辑，布尔值直接切换） ",
-        items,
-        app.field_idx,
-    );
+    render_list(frame, chunks[1], " 字段 ", items, app.field_idx);
 }
 
 fn draw_variant_list(frame: &mut Frame, app: &App, area: Rect) {
@@ -324,13 +319,7 @@ fn draw_variant_list(frame: &mut Frame, app: &App, area: Rect) {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    render_list(
-        frame,
-        area,
-        " 条件变体 · a 新增 / d 删除 / Shift+↑↓ 移动 ",
-        items,
-        app.variant_idx,
-    );
+    render_list(frame, area, " 条件变体 ", items, app.variant_idx);
 }
 
 fn draw_variant_edit(frame: &mut Frame, app: &App, area: Rect) {
@@ -343,20 +332,10 @@ fn draw_variant_edit(frame: &mut Frame, app: &App, area: Rect) {
             let value = app
                 .variant_field_value(field)
                 .unwrap_or_else(|| field.default.clone());
-            field_item(
-                selected,
-                field.label,
-                &app.variant_field_display(field, &value),
-            )
+            field_item(selected, field.label, &app.field_display(field, &value))
         })
         .collect();
-    render_list(
-        frame,
-        area,
-        " 编辑变体 · 条件与覆盖参数 ",
-        items,
-        app.field_idx,
-    );
+    render_list(frame, area, " 编辑变体 ", items, app.field_idx);
 }
 
 fn draw_copilot(frame: &mut Frame, app: &App, area: Rect) {
@@ -446,7 +425,7 @@ fn draw_single_copilot(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .block(panel(" 当前单作业 · 替换而非保留历史列表 ")),
+            .block(panel(" 当前单作业 ")),
         area,
     );
 }
@@ -501,23 +480,7 @@ fn draw_copilot_list(frame: &mut Frame, app: &App, area: Rect) {
             })
             .collect()
     };
-    let import = app
-        .copilot_import_progress
-        .as_ref()
-        .map(|progress| {
-            format!(
-                " · 导入 {}/{} {}",
-                progress.completed, progress.total, progress.label
-            )
-        })
-        .unwrap_or_default();
-    let title = format!(
-        " 作业集列表 · 已启用 {}/{}{} ",
-        cache.enabled_count(),
-        indices.len(),
-        import
-    );
-    render_list(frame, area, &title, items, app.copilot_idx);
+    render_list(frame, area, " 作业集 ", items, app.copilot_idx);
 }
 
 fn draw_copilot_settings(frame: &mut Frame, app: &App, area: Rect) {
@@ -556,37 +519,71 @@ fn draw_copilot_settings(frame: &mut Frame, app: &App, area: Rect) {
         .enumerate()
         .map(|(index, (label, value))| field_item(index == app.copilot_settings_idx, label, value))
         .collect();
-    render_list(
-        frame,
-        area,
-        " 共享运行设置 · Enter 编辑 ",
-        items,
-        app.copilot_settings_idx,
-    );
+    render_list(frame, area, " 运行设置 ", items, app.copilot_settings_idx);
 }
 
 fn draw_update(frame: &mut Frame, app: &App, area: Rect) {
-    let rows = [
-        (
-            "仅更新活动与导航资源",
-            "热更新 MaaResource；不更新 MaaCore 和基础资源".to_string(),
-        ),
-        (
-            "更新 MaaCore 与基础资源",
-            "更新核心运行库及随包资源；适合 OCR/兼容性修复".to_string(),
-        ),
+    let options = ["仅更新活动与导航资源", "更新 MaaCore 与基础资源"];
+    let details = [
+        [
+            "作用范围：活动关卡、导航与 MaaResource 热更新资源",
+            "不会更新：MaaCore 与随包基础资源",
+            "适用场景：活动开放、关卡导航或资源数据更新",
+            "执行命令：maa hot-update --batch -v",
+        ],
+        [
+            "作用范围：MaaCore 与随包基础资源",
+            "同时更新：核心运行库及兼容性相关资源",
+            "适用场景：OCR、核心兼容性或版本问题修复",
+            "执行命令：maa update --batch -v",
+        ],
     ];
-    let items = rows
+    let selected = app.update_idx.min(options.len() - 1);
+    let chunks = if area.width >= 80 {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(4), Constraint::Min(5)])
+            .split(area)
+    };
+    let items = options
         .iter()
         .enumerate()
-        .map(|(index, (label, value))| field_item(index == app.update_idx, label, value))
+        .map(|(index, label)| {
+            let is_selected = index == selected;
+            ListItem::new(Span::styled(
+                format!("{} {label}", if is_selected { "▶" } else { " " }),
+                if is_selected {
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                },
+            ))
+        })
         .collect();
-    render_list(
-        frame,
-        area,
-        " 更新管理 · Enter 后确认执行 ",
-        items,
-        app.update_idx,
+    render_list(frame, chunks[0], " 更新方式 ", items, selected);
+
+    let lines = details[selected]
+        .iter()
+        .enumerate()
+        .flat_map(|(index, text)| {
+            let mut lines = vec![Line::from(format!("  {text}"))];
+            if index + 1 < details[selected].len() {
+                lines.push(Line::from(""));
+            }
+            lines
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().fg(Color::White))
+            .wrap(Wrap { trim: false })
+            .block(panel(" 说明 ")),
+        chunks[1],
     );
 }
 
@@ -647,29 +644,37 @@ fn draw_running_control(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
-    let block = panel(" 日志 ").title_bottom(Line::from(Span::styled(
+    let scope = app.visible_log_scope();
+    let buffer = app.log_buffer(scope);
+    let title = match scope {
+        LogScope::Daily => " 每日任务日志 ",
+        LogScope::Copilot => " 自动战斗日志 ",
+        LogScope::Update => " 更新管理日志 ",
+    };
+    let block = panel(title).title_bottom(Line::from(Span::styled(
         format!(
             " {} · {} 行 ",
-            if app.auto_scroll { "AUTO" } else { "MANUAL" },
-            app.logs.len()
+            if buffer.auto_scroll { "AUTO" } else { "MANUAL" },
+            buffer.lines.len()
         ),
         Style::default().fg(MUTED),
     )));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let max_scroll = app.max_scroll(inner.height);
-    if app.auto_scroll {
-        app.scroll = max_scroll;
+    let buffer = app.log_buffer_mut(scope);
+    let max_scroll = (buffer.lines.len() as u16).saturating_sub(inner.height.max(1));
+    if buffer.auto_scroll {
+        buffer.scroll = max_scroll;
     } else {
-        app.scroll = app.scroll.min(max_scroll);
-        if app.scroll >= max_scroll {
-            app.auto_scroll = true;
+        buffer.scroll = buffer.scroll.min(max_scroll);
+        if buffer.scroll >= max_scroll {
+            buffer.auto_scroll = true;
         }
     }
 
-    let lines: Vec<Line> = app
-        .logs
+    let lines: Vec<Line> = buffer
+        .lines
         .iter()
         .map(|log| {
             let (prefix, level_color, text_color) = log_style(log.level);
@@ -687,7 +692,7 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .scroll((app.scroll, 0)),
+            .scroll((buffer.scroll, 0)),
         inner,
     );
 }
@@ -702,81 +707,77 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn footer_keys(app: &App, width: usize) -> String {
-    let (full, medium, compact) = if app.phase != TaskPhase::Idle {
-        (
-            "Enter/s 停止  PgUp/PgDn 滚动  q 停止并退出",
-            "Enter/s 停止  PgUp/PgDn 滚动",
-            "Enter/s 停止",
-        )
-    } else {
-        match app.screen {
-            Screen::Main => (
-                "↑↓/jk 选择  Enter 确认  q 退出",
-                "↑↓ 选择  Enter 确认  q 退出",
-                "↑↓ Enter q",
-            ),
-            Screen::Daily => (
-                "↑↓/jk 选择  Enter 运行/配置  r 运行  c 配置  Esc 返回",
-                "↑↓ 选择  Enter 确认  r 运行  Esc 返回",
-                "↑↓ Enter r Esc",
-            ),
-            Screen::Config => (
-                "Space 开关  Enter/e 编辑  a 新增  d 删除  Shift+↑↓ 移动  r 重载  Esc 返回",
-                "Space 开关  Enter 编辑  a 新增  d 删除  Esc 返回",
-                "↑↓ Enter Space Esc",
-            ),
-            Screen::AddTask => (
-                "↑↓ 选择类型  Enter 新增并编辑  Esc 返回",
-                "↑↓ 选择  Enter 新增  Esc 返回",
-                "↑↓ Enter Esc",
-            ),
-            Screen::TaskEdit => (
-                "←→/hl 切换层级  ↑↓ 选择  Enter/e 编辑  v 创建活动变体  Esc 返回",
-                "←→ 切层  ↑↓ 选择  Enter 编辑  Esc 返回",
-                "←→ ↑↓ Enter Esc",
-            ),
-            Screen::VariantList => (
-                "a 新增  d 删除  Shift+↑↓ 移动  Enter 编辑  Esc 返回",
-                "↑↓ 选择  Enter 编辑  a 新增  Esc 返回",
-                "↑↓ Enter a Esc",
-            ),
-            Screen::VariantEdit => (
-                "↑↓ 选择  Enter 编辑  Esc 返回",
-                "↑↓ 选择  Enter 编辑  Esc 返回",
-                "↑↓ Enter Esc",
-            ),
-            Screen::Copilot => match app.copilot_section() {
-                CopilotSection::Singles => (
-                    "e/a 搜索或替换  Space 切换双模式难度  i 查看详情  Enter 运行  Tab 切页签  Esc 返回",
-                    "e 搜索  Space 难度  Enter 运行  Tab 切页  Esc 返回",
-                    "e Enter Tab Esc",
-                ),
-                CopilotSection::Sets => (
-                    "↑↓ 选择  Space 启停  a 添加  t 全部启停  c 清空  i 详情  d 删除  Shift+↑↓ 移动  Enter 单独运行  r 批量运行  Tab 切页签  Esc 返回",
-                    "↑↓ 选择  Space 启停  Enter 单跑  r 批量  Tab 切页  Esc 返回",
-                    "↑↓ Space Enter r Tab Esc",
-                ),
-                CopilotSection::Settings => (
-                    "↑↓ 选择  Enter/e 编辑  r 批量运行  Tab/←→ 作业页签  Esc 返回",
-                    "↑↓ 选择  Enter 编辑  r 批量  Tab 切页  Esc 返回",
-                    "↑↓ Enter r Tab Esc",
-                ),
-            },
-            Screen::Update => (
-                "↑↓/jk 选择  Enter 更新  Esc 返回",
-                "↑↓ 选择  Enter 更新  Esc 返回",
-                "↑↓ Enter Esc",
-            ),
+    if let Some(keys) = modal_footer_keys(app) {
+        return truncate_display_width(keys, width);
+    }
+
+    const HELP: &str = "?全部";
+    if width < HELP.width() {
+        return truncate_display_width(HELP, width);
+    }
+
+    let mut hints = shortcut_hints(app);
+    hints.sort_by_key(|hint| hint.priority);
+    let mut parts = Vec::new();
+    let mut used = HELP.width();
+    for hint in hints {
+        let part = format!("{}{}", hint.key, hint.label);
+        let cost = part.width() + 2;
+        if used + cost <= width {
+            used += cost;
+            parts.push(part);
         }
-    };
-    [full, medium, compact]
-        .into_iter()
-        .find(|text| text.width() <= width)
-        .map(str::to_string)
-        .unwrap_or_else(|| truncate_display_width(compact, width))
+    }
+    parts.push(HELP.to_string());
+    parts.join("  ")
 }
 
-fn draw_input_dialog(frame: &mut Frame, area: Rect, title: &str, value: &str) {
+fn modal_footer_keys(app: &App) -> Option<&'static str> {
+    if app.shortcut_help_open {
+        Some("↑↓/jk滚动  PgUp/PgDn快翻  ?/Esc/q关闭")
+    } else if app.copilot_detail.is_some() {
+        Some("↑↓/jk滚动  PgUp/PgDn快翻  Esc/q关闭")
+    } else if app.input.is_some() {
+        Some("Enter确认  Esc取消  Ctrl+U清空")
+    } else if app.select.is_some() {
+        Some("↑↓/jk选择  Enter确认  Esc取消")
+    } else if app.confirm.is_some() {
+        Some("Enter/y确认  n/Esc取消")
+    } else {
+        None
+    }
+}
+
+fn shortcut_hints(app: &App) -> Vec<ShortcutHint> {
+    shortcut_hints_for(app.shortcut_context())
+}
+
+fn shortcut_help_title(app: &App) -> String {
+    if app.phase != TaskPhase::Idle {
+        return "任务运行中".to_string();
+    }
+    match app.screen {
+        Screen::Main => "主菜单".to_string(),
+        Screen::Daily => "每日任务".to_string(),
+        Screen::Config => "配置管理".to_string(),
+        Screen::AddTask => "新增任务".to_string(),
+        Screen::TaskEdit => "任务编辑".to_string(),
+        Screen::VariantList => "变体列表".to_string(),
+        Screen::VariantEdit => "变体编辑".to_string(),
+        Screen::Copilot => format!("自动战斗 · {}", app.copilot_section().label()),
+        Screen::Update => "更新管理".to_string(),
+    }
+}
+
+fn input_dialog_hint(input: &InputDialog) -> &'static str {
+    if input.allows_import_kind_switch() {
+        "  Enter 确认 · Esc 取消 · Ctrl+U 清空 · ←/→ 切换添加类型"
+    } else {
+        "  Enter 确认 · Esc 取消 · Ctrl+U 清空"
+    }
+}
+
+fn draw_input_dialog(frame: &mut Frame, area: Rect, input: &InputDialog) {
     let popup = centered_rect(76, 7, area);
     frame.render_widget(Clear, popup);
     frame.render_widget(
@@ -788,7 +789,7 @@ fn draw_input_dialog(frame: &mut Frame, area: Rect, title: &str, value: &str) {
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    value,
+                    &input.value,
                     Style::default()
                         .fg(Color::White)
                         .add_modifier(Modifier::UNDERLINED),
@@ -796,7 +797,7 @@ fn draw_input_dialog(frame: &mut Frame, area: Rect, title: &str, value: &str) {
                 Span::styled("█", Style::default().fg(ACCENT)),
             ]),
             Line::from(Span::styled(
-                "  Enter 确认 · Esc 取消 · Ctrl+U 清空 · 批量添加时 ←/→ 切换类型",
+                input_dialog_hint(input),
                 Style::default().fg(MUTED),
             )),
         ])
@@ -804,7 +805,7 @@ fn draw_input_dialog(frame: &mut Frame, area: Rect, title: &str, value: &str) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(ACCENT))
-                .title(format!(" {title} ")),
+                .title(format!(" {} ", input.title)),
         ),
         popup,
     );
@@ -920,6 +921,72 @@ fn draw_copilot_detail(frame: &mut Frame, area: Rect, detail: &mut CopilotDetail
     );
 }
 
+fn draw_shortcut_help(frame: &mut Frame, area: Rect, app: &mut App) {
+    let height = area.height.saturating_sub(4).clamp(10, 30);
+    let popup = centered_rect(92, height, area);
+    frame.render_widget(Clear, popup);
+    let title = format!(" 快捷键 · {} ", shortcut_help_title(app));
+    let block = panel(&title).title_bottom(Line::from(Span::styled(
+        " ?/Esc/q 关闭 · ↑↓/jk 滚动 · PgUp/PgDn 快速滚动 ",
+        Style::default().fg(MUTED),
+    )));
+    let inner = block.inner(popup);
+    let hints = shortcut_hints(app);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    for group in ["导航", "运行", "编辑", "批量"] {
+        let group_hints: Vec<_> = hints.iter().filter(|hint| hint.group == group).collect();
+        if group_hints.is_empty() {
+            continue;
+        }
+        lines.push(Line::from(Span::styled(
+            format!(" {group} "),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )));
+        for hint in group_hints {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {}", pad_display_width(hint.key, 16)),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    pad_display_width(hint.label, 12),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled(hint.description, Style::default().fg(Color::White)),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("  {}", pad_display_width("?", 16)),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            pad_display_width("全部快捷键", 12),
+            Style::default().fg(Color::White),
+        ),
+        Span::styled("打开或关闭此帮助面板", Style::default().fg(MUTED)),
+    ]));
+
+    let popup_width = inner.width.max(1);
+    let content_rows = lines
+        .iter()
+        .map(|line| (line.width() as u16).max(1).div_ceil(popup_width))
+        .sum::<u16>();
+    let max_scroll = content_rows.saturating_sub(inner.height);
+    app.shortcut_help_scroll = app.shortcut_help_scroll.min(max_scroll);
+    frame.render_widget(block, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((app.shortcut_help_scroll, 0)),
+        inner,
+    );
+}
+
 fn draw_confirm_dialog(frame: &mut Frame, area: Rect, message: &str) {
     let popup = centered_rect(64, 7, area);
     frame.render_widget(Clear, popup);
@@ -1012,13 +1079,19 @@ fn form_content_height(app: &App, total_height: u16) -> u16 {
     const FORM_MIN: u16 = 4;
     const BORDER: u16 = 2;
 
+    if app.screen == Screen::Update {
+        let usable = total_height.saturating_sub(HEADER + FOOTER);
+        let desired = usable.saturating_mul(2) / 3;
+        return desired.clamp(FORM_MIN, usable.saturating_sub(LOGS_MIN).max(FORM_MIN));
+    }
+
     let rows = match app.screen {
         Screen::Copilot => match app.copilot_section() {
             CopilotSection::Singles => 8,
             CopilotSection::Sets => app.copilot_visible_indices().len().max(1) as u16 + 3,
             CopilotSection::Settings => 11,
         },
-        Screen::Daily | Screen::Update => 2,
+        Screen::Daily => 2,
         Screen::Main => MainMenuItem::ALL.len() as u16,
         Screen::AddTask => TASK_TYPES.len() as u16,
         Screen::Config => app
@@ -1028,6 +1101,7 @@ fn form_content_height(app: &App, total_height: u16) -> u16 {
             .unwrap_or(1),
         Screen::TaskEdit | Screen::VariantEdit => 6,
         Screen::VariantList => 4,
+        Screen::Update => unreachable!("更新页已使用专用布局"),
     };
     let desired = rows.saturating_add(BORDER).max(FORM_MIN);
     let reserved = HEADER.saturating_add(FOOTER).saturating_add(LOGS_MIN);
@@ -1084,6 +1158,10 @@ fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::{CopilotTextField, ImportDestination, InputDialog, InputTarget};
+    use crate::copilot::ImportKind;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     #[test]
     fn info_log_uses_cyan_marker_and_neutral_text() {
@@ -1110,15 +1188,141 @@ mod tests {
     }
 
     #[test]
-    fn copilot_footer_never_exceeds_available_width() {
+    fn page_footer_exposes_help_when_space_allows() {
         let mut app = App::new();
+        app.copilot_cache = None;
         app.screen = Screen::Copilot;
         app.copilot_section_idx = 1;
-        for width in [8, 16, 32, 60, 120] {
+        for width in [5, 8, 16, 32, 60, 120] {
             let text = footer_keys(&app, width);
             assert!(text.width() <= width, "width={width}, text={text}");
+            assert!(text.contains("?全部"), "width={width}, text={text}");
         }
-        assert!(footer_keys(&app, 32).contains("Enter"));
+        let narrow = footer_keys(&app, 4);
+        assert!(narrow.width() <= 4);
+        assert!(!narrow.contains("?全部"));
+    }
+
+    #[test]
+    fn copilot_footer_keeps_labels_instead_of_key_only_fallback() {
+        let mut app = App::new();
+        app.copilot_cache = None;
+        app.screen = Screen::Copilot;
+        app.copilot_section_idx = 0;
+
+        let text = footer_keys(&app, 32);
+
+        assert!(text.contains("搜索"));
+        assert!(text.contains("?全部"));
+        assert!(!text.contains("e Enter Tab Esc"));
+    }
+
+    #[test]
+    fn empty_copilot_set_keeps_all_shortcuts_discoverable() {
+        let mut app = App::new();
+        app.copilot_cache = None;
+        app.screen = Screen::Copilot;
+        app.copilot_section_idx = 1;
+
+        let footer = footer_keys(&app, 160);
+        let hints = shortcut_hints(&app);
+
+        assert!(footer.contains("单跑"));
+        assert!(footer.contains("批量"));
+        assert!(footer.contains("?全部"));
+        for key in ["Enter/e", "r", "Space", "a", "i", "d", "t", "c"] {
+            assert!(hints.iter().any(|hint| hint.key == key), "missing {key}");
+        }
+    }
+
+    #[test]
+    fn modal_footer_uses_its_own_context_without_page_help() {
+        let mut app = App::new();
+        app.input = Some(InputDialog {
+            title: "输入".to_string(),
+            value: String::new(),
+            target: InputTarget::CopilotText(CopilotTextField::SupportName),
+        });
+
+        let input_footer = footer_keys(&app, 80);
+        assert!(input_footer.contains("Enter确认"));
+        assert!(!input_footer.contains("?全部"));
+
+        app.input = None;
+        app.shortcut_help_open = true;
+        let help_footer = footer_keys(&app, 80);
+        assert!(help_footer.contains("关闭"));
+        assert!(!help_footer.contains("?全部"));
+    }
+
+    #[test]
+    fn input_dialog_only_shows_kind_switch_for_batch_imports() {
+        let normal = InputDialog {
+            title: "助战干员".to_string(),
+            value: String::new(),
+            target: InputTarget::CopilotText(CopilotTextField::SupportName),
+        };
+        let batch = InputDialog {
+            title: "添加作业".to_string(),
+            value: String::new(),
+            target: InputTarget::CopilotAdd {
+                kind: ImportKind::Set,
+                destination: ImportDestination::Batch,
+            },
+        };
+
+        assert!(!input_dialog_hint(&normal).contains("切换添加类型"));
+        assert!(input_dialog_hint(&batch).contains("切换添加类型"));
+    }
+
+    #[test]
+    fn footer_renders_in_a_narrow_test_backend() {
+        let app = App::new();
+        let backend = TestBackend::new(5, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| draw_footer(frame, &app, frame.area()))
+            .unwrap();
+
+        assert_eq!(terminal.backend().buffer().area, Rect::new(0, 0, 5, 1));
+    }
+
+    #[test]
+    fn update_layout_separates_options_from_selected_description() {
+        let app = App::new();
+        let backend = TestBackend::new(100, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| draw_update(frame, &app, frame.area()))
+            .unwrap();
+
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .filter(|symbol| !symbol.trim().is_empty())
+            .collect::<String>();
+        assert!(text.contains("更新方式"));
+        assert!(text.contains("说明"));
+        assert!(text.contains("仅更新活动与导航资源"));
+        assert!(text.contains("执行命令：maahot-update--batch-v"));
+    }
+
+    #[test]
+    fn update_layout_falls_back_for_narrow_terminals() {
+        let app = App::new();
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| draw_update(frame, &app, frame.area()))
+            .unwrap();
+
+        assert_eq!(terminal.backend().buffer().area, Rect::new(0, 0, 60, 12));
     }
 
     #[test]
@@ -1135,6 +1339,7 @@ mod tests {
         // 矮终端时优先保住日志 Min(8)
         assert_eq!(form_content_height(&app, 20), 8);
         app.screen = Screen::Update;
-        assert_eq!(form_content_height(&app, 40), 4);
+        assert_eq!(form_content_height(&app, 40), 24);
+        assert_eq!(form_content_height(&app, 20), 8);
     }
 }

@@ -35,57 +35,77 @@ pub enum RunnerEvent {
     Exited { code: Option<i32>, stopped: bool },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskKind {
+    Daily,
+    Copilot,
+    Update,
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskCommand {
+    pub kind: TaskKind,
     pub label: String,
     pub program: String,
     pub args: Vec<String>,
     pub envs: Vec<(String, String)>,
-    pub track_daily_progress: bool,
-    pub track_copilot_progress: bool,
 }
 
 impl TaskCommand {
     pub fn daily() -> Self {
-        let mut command = Self::maa("每日任务", ["run", "daily", "-v"]);
-        command.track_daily_progress = true;
-        command
+        Self::maa(TaskKind::Daily, "每日任务", ["run", "daily", "-v"])
     }
 
     pub fn copilot(args: Vec<String>) -> Self {
-        let mut command = Self::maa("自动战斗", std::iter::empty::<&str>());
+        let mut command = Self::maa(TaskKind::Copilot, "自动战斗", std::iter::empty::<&str>());
         command.args = args;
-        command.track_copilot_progress = true;
         command
     }
 
     pub fn copilot_batch(task_path: &str) -> Self {
-        let mut command = Self::maa("作业集自动战斗", ["run", task_path, "--batch", "-v"]);
-        command.track_copilot_progress = true;
-        command
+        Self::maa(
+            TaskKind::Copilot,
+            "作业集自动战斗",
+            ["run", task_path, "--batch", "-v"],
+        )
     }
 
     pub fn resource_update() -> Self {
-        Self::maa("资源热更新", ["hot-update", "--batch", "-v"])
+        Self::maa(
+            TaskKind::Update,
+            "资源热更新",
+            ["hot-update", "--batch", "-v"],
+        )
     }
 
     pub fn core_update() -> Self {
-        Self::maa("Core 与基础资源更新", ["update", "--batch", "-v"])
+        Self::maa(
+            TaskKind::Update,
+            "Core 与基础资源更新",
+            ["update", "--batch", "-v"],
+        )
     }
 
-    pub fn maa<I, S>(label: impl Into<String>, args: I) -> Self
+    fn maa<I, S>(kind: TaskKind, label: impl Into<String>, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
         Self {
+            kind,
             label: label.into(),
             program: "maa".to_string(),
             args: args.into_iter().map(Into::into).collect(),
             envs: vec![("MAA_LOG_PREFIX".to_string(), "Always".to_string())],
-            track_daily_progress: false,
-            track_copilot_progress: false,
         }
+    }
+
+    pub fn tracks_daily_progress(&self) -> bool {
+        self.kind == TaskKind::Daily
+    }
+
+    pub fn tracks_copilot_progress(&self) -> bool {
+        self.kind == TaskKind::Copilot
     }
 
     pub fn display(&self) -> String {
@@ -290,14 +310,10 @@ pub struct RunningTask {
 
 impl RunningTask {
     pub fn spawn(command: &TaskCommand) -> Result<Self, String> {
-        let core_log = (command.track_daily_progress || command.track_copilot_progress)
-            .then(|| {
-                CoreLogCursor::prepare(
-                    &command.program,
-                    command.track_daily_progress,
-                    command.track_copilot_progress,
-                )
-            })
+        let track_daily = command.tracks_daily_progress();
+        let track_copilot = command.tracks_copilot_progress();
+        let core_log = (track_daily || track_copilot)
+            .then(|| CoreLogCursor::prepare(&command.program, track_daily, track_copilot))
             .transpose()?;
         Self::spawn_command_with_env(
             &command.program,
@@ -573,7 +589,8 @@ mod tests {
 
         let batch = TaskCommand::copilot_batch("/tmp/batch.json");
         assert_eq!(batch.args, ["run", "/tmp/batch.json", "--batch", "-v"]);
-        assert!(batch.track_copilot_progress);
+        assert_eq!(batch.kind, TaskKind::Copilot);
+        assert!(batch.tracks_copilot_progress());
     }
 
     #[test]

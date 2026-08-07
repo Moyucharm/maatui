@@ -4,12 +4,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use crate::storage::maa_config_dir;
+use crate::http::{USER_AGENT, agent};
+use crate::storage::{atomic_write, maa_config_dir};
 
 const STAGE_ACTIVITY_URLS: [&str; 2] = [
     "https://api.maa.plus/MaaAssistantArknights/api/gui/StageActivityV2.json",
@@ -19,8 +20,6 @@ const TASKS_URLS: [&str; 2] = [
     "https://api.maa.plus/MaaAssistantArknights/api/resource/tasks.json",
     "https://ota.maa.plus/MaaAssistantArknights/api/resource/tasks.json",
 ];
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-
 #[derive(Debug, Clone)]
 pub struct StageEntry {
     pub client: String,
@@ -69,8 +68,8 @@ impl StageCatalog {
         entries
     }
 
-    pub fn spawn_refresh(sender: Sender<StageRefreshEvent>) {
-        let _ = thread::Builder::new()
+    pub fn spawn_refresh(sender: Sender<StageRefreshEvent>) -> std::io::Result<()> {
+        thread::Builder::new()
             .name("maatui-stage-refresh".to_string())
             .spawn(move || match refresh_catalog() {
                 Ok((catalog, tasks_updated)) => {
@@ -82,7 +81,8 @@ impl StageCatalog {
                 Err(error) => {
                     let _ = sender.send(StageRefreshEvent::Failed(error.to_string()));
                 }
-            });
+            })
+            .map(|_| ())
     }
 
     fn from_json(root: &Value) -> Self {
@@ -204,19 +204,10 @@ impl Availability {
 
 fn refresh_catalog() -> Result<(StageCatalog, bool)> {
     let (stage_path, tasks_path) = cache_paths()?;
-    let agent = http_agent();
+    let agent = agent();
     let stage_json = fetch_json(&agent, &STAGE_ACTIVITY_URLS, &stage_path)?;
     let tasks_updated = fetch_json(&agent, &TASKS_URLS, &tasks_path).is_ok();
     Ok((StageCatalog::from_json(&stage_json), tasks_updated))
-}
-
-fn http_agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout_read(REQUEST_TIMEOUT)
-        .timeout_write(Duration::from_secs(10))
-        .timeout(REQUEST_TIMEOUT)
-        .build()
 }
 
 fn fetch_json(agent: &ureq::Agent, urls: &[&str], cache_path: &Path) -> Result<Value> {
@@ -225,7 +216,7 @@ fn fetch_json(agent: &ureq::Agent, urls: &[&str], cache_path: &Path) -> Result<V
     let mut errors = Vec::new();
 
     for url in urls {
-        let mut request = agent.get(url).set("User-Agent", "MaaTUI/0.1");
+        let mut request = agent.get(url).set("User-Agent", USER_AGENT);
         if !etag.trim().is_empty() {
             request = request.set("If-None-Match", etag.trim());
         }
@@ -243,9 +234,9 @@ fn fetch_json(agent: &ureq::Agent, urls: &[&str], cache_path: &Path) -> Result<V
                 if let Some(parent) = cache_path.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                fs::write(cache_path, raw)?;
+                atomic_write(cache_path, raw.as_bytes())?;
                 if !next_etag.is_empty() {
-                    fs::write(&etag_path, next_etag)?;
+                    atomic_write(&etag_path, next_etag.as_bytes())?;
                 }
                 return Ok(json);
             }

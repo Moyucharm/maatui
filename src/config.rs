@@ -159,10 +159,6 @@ impl DailyConfig {
         Ok(config)
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     pub fn len(&self) -> usize {
         match &self.data {
             ConfigData::Toml(doc) => doc

@@ -102,8 +102,13 @@ fn resolve_stage_code_from_overview(raw: &str, stage_name: &str) -> Option<Strin
         return Some(code.to_string());
     }
     map.values().find_map(|summary| {
-        let code = summary.get("code")?.as_str()?;
-        (code == stage_name && is_safe_stage_code(code)).then(|| code.to_string())
+        let summary = summary.as_object()?;
+        let code = summary
+            .get("code")
+            .and_then(Value::as_str)
+            .filter(|code| is_safe_stage_code(code))?;
+        let stage_id = summary.get("stageId").and_then(Value::as_str);
+        (code == stage_name || stage_id == Some(stage_name)).then(|| code.to_string())
     })
 }
 
@@ -215,18 +220,28 @@ mod tests {
     #[test]
     fn resolves_internal_stage_id_and_keeps_navigation_code() {
         let overview = r#"{
-            "act53side_01": {
-                "code": "TO-1",
-                "filename": "act53side_01-level.json"
+            "act53side_ex01#f#-activities/act53side/level_act53side_ex01": {
+                "code": "TO-EX-1",
+                "filename": "act53side_ex01#f#-activities-act53side-level_act53side_ex01.json",
+                "stageId": "act53side_ex01#f#"
+            },
+            "act53side_ex01-activities/act53side/level_act53side_ex01": {
+                "code": "TO-EX-1",
+                "filename": "act53side_ex01-activities-act53side-level_act53side_ex01.json",
+                "stageId": "act53side_ex01"
             }
         }"#;
         assert_eq!(
-            resolve_stage_code_from_overview(overview, "act53side_01").as_deref(),
-            Some("TO-1")
+            resolve_stage_code_from_overview(overview, "act53side_ex01").as_deref(),
+            Some("TO-EX-1")
         );
         assert_eq!(
-            resolve_stage_code_from_overview(overview, "TO-1").as_deref(),
-            Some("TO-1")
+            resolve_stage_code_from_overview(overview, "act53side_ex01#f#").as_deref(),
+            Some("TO-EX-1")
+        );
+        assert_eq!(
+            resolve_stage_code_from_overview(overview, "TO-EX-1").as_deref(),
+            Some("TO-EX-1")
         );
         assert!(resolve_stage_code_from_overview(overview, "missing").is_none());
     }

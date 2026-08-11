@@ -9,6 +9,7 @@ use serde_json::{Value as JsonValue, json};
 
 use super::cache::{CopilotCache, CopilotEntry, CopilotEntrySource};
 use crate::storage::{atomic_write, maatui_cache_dir};
+use crate::tile_alias;
 
 #[derive(Debug, Clone)]
 pub struct CopilotRunOptions {
@@ -40,6 +41,22 @@ pub(crate) fn write_batch_task_in(
     options: &CopilotRunOptions,
     cache_dir: &Path,
 ) -> Result<BatchTask> {
+    write_batch_task_in_with_resolver(
+        cache,
+        indices,
+        options,
+        cache_dir,
+        tile_alias::resolve_stage_code,
+    )
+}
+
+fn write_batch_task_in_with_resolver(
+    cache: &CopilotCache,
+    indices: Vec<usize>,
+    options: &CopilotRunOptions,
+    cache_dir: &Path,
+    resolve_stage_code: impl Fn(&str) -> Option<String>,
+) -> Result<BatchTask> {
     if indices.is_empty() {
         bail!("没有启用的作业");
     }
@@ -55,9 +72,11 @@ pub(crate) fn write_batch_task_in(
         if !path.is_file() {
             bail!("作业文件不存在: {}", path.display());
         }
+        let stage_name =
+            resolve_stage_code(&entry.stage_name).unwrap_or_else(|| entry.stage_name.clone());
         list.push(json!({
             "filename": path,
-            "stage_name": entry.stage_name,
+            "stage_name": stage_name,
             "is_raid": entry.is_raid,
         }));
     }
@@ -123,5 +142,75 @@ pub(super) fn resolve_entry_path(entry: &CopilotEntry, files_dir: &Path) -> Path
     match &entry.source {
         CopilotEntrySource::Remote { id } => files_dir.join(format!("{id}.json")),
         CopilotEntrySource::Local { path } => path.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::copilot::CopilotOrigin;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("maatui-copilot-batch-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn normalizes_cached_internal_stage_name_when_writing_batch_task() {
+        let dir = temp_dir();
+        let files_dir = dir.join("files");
+        fs::create_dir_all(&files_dir).unwrap();
+        fs::write(files_dir.join("99366.json"), "{}").unwrap();
+
+        let mut cache =
+            CopilotCache::load(dir.join("copilot-set.json"), files_dir.clone()).unwrap();
+        cache
+            .append(vec![CopilotEntry {
+                enabled: true,
+                stage_name: "act53side_ex01".to_string(),
+                title: Some("TO-EX-1 测试作业".to_string()),
+                is_raid: false,
+                source: CopilotEntrySource::Remote { id: 99366 },
+                origin: CopilotOrigin::Set {
+                    id: 51251,
+                    name: Some("测试作业集".to_string()),
+                },
+            }])
+            .unwrap();
+
+        let task = write_batch_task_in_with_resolver(
+            &cache,
+            vec![0],
+            &CopilotRunOptions {
+                formation_index: 0,
+                use_sanity_potion: false,
+                add_trust: true,
+                ignore_requirements: true,
+                support_unit_usage: 0,
+                support_unit_name: String::new(),
+            },
+            &dir,
+            |stage_name| (stage_name == "act53side_ex01").then(|| "TO-EX-1".to_string()),
+        )
+        .unwrap();
+
+        let value: JsonValue =
+            serde_json::from_str(&fs::read_to_string(&task.path).unwrap()).unwrap();
+        let item = value.pointer("/tasks/0/params/copilot_list/0").unwrap();
+        assert_eq!(item["stage_name"], "TO-EX-1");
+        assert_eq!(item["is_raid"], false);
+        assert_eq!(
+            item["filename"].as_str(),
+            files_dir.join("99366.json").to_str()
+        );
+        assert_eq!(task.indices, vec![0]);
+
+        fs::remove_dir_all(dir).unwrap();
     }
 }

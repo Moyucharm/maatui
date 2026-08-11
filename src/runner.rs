@@ -49,11 +49,28 @@ pub struct TaskCommand {
     pub program: String,
     pub args: Vec<String>,
     pub envs: Vec<(String, String)>,
+    /// 单任务执行：记录选中的任务索引，用于构造进度集合。
+    pub daily_single_index: Option<usize>,
+    /// 运行结束后需要删除的临时文件（单任务执行生成）。
+    pub cleanup: Option<PathBuf>,
 }
 
 impl TaskCommand {
     pub fn daily() -> Self {
         Self::maa(TaskKind::Daily, "每日任务", ["run", "daily", "-v"])
+    }
+
+    /// 单独执行 daily 配置中第 `index` 个任务：运行只含该任务的临时文件，
+    /// 结束后删除 `cleanup` 指向的临时任务文件。
+    pub fn daily_single(index: usize, task_name: &str, file_name: &str, cleanup: PathBuf) -> Self {
+        let mut command = Self::maa(
+            TaskKind::Daily,
+            format!("单任务：{task_name}"),
+            ["run", file_name, "-v"],
+        );
+        command.daily_single_index = Some(index);
+        command.cleanup = Some(cleanup);
+        command
     }
 
     pub fn copilot(args: Vec<String>) -> Self {
@@ -97,6 +114,8 @@ impl TaskCommand {
             program: "maa".to_string(),
             args: args.into_iter().map(Into::into).collect(),
             envs: vec![("MAA_LOG_PREFIX".to_string(), "Always".to_string())],
+            daily_single_index: None,
+            cleanup: None,
         }
     }
 

@@ -186,6 +186,56 @@ impl DailyConfig {
         })
     }
 
+    /// 将第 `index` 个任务单独导出为一个临时任务文件（强制 `enable = true`），
+    /// 返回 `(文件路径, 无扩展名文件名)`。文件名不以 `daily.` 开头，不会干扰日常加载。
+    pub fn write_single_task_file(&self, index: usize) -> Result<(PathBuf, String)> {
+        let tasks_dir = maa_config_dir()?.join("tasks");
+        self.write_single_task_file_into(index, &tasks_dir)
+    }
+
+    fn write_single_task_file_into(
+        &self,
+        index: usize,
+        tasks_dir: &Path,
+    ) -> Result<(PathBuf, String)> {
+        // 带进程号命名，避免多实例并发相互覆盖或残留。
+        let basename = format!("maatui-single-daily-{}", std::process::id());
+        let (extension, content) = self.single_task_content(index)?;
+        fs::create_dir_all(tasks_dir)?;
+        let path = tasks_dir.join(format!("{basename}.{extension}"));
+        atomic_write(&path, content.as_bytes())?;
+        Ok((path, basename))
+    }
+
+    /// 将第 `index` 个任务序列化为单独任务文件内容（强制 `enable = true`），
+    /// 返回 `(扩展名, 内容)`。
+    fn single_task_content(&self, index: usize) -> Result<(String, String)> {
+        match (&self.format, &self.data) {
+            (ConfigFormat::Toml, ConfigData::Toml(doc)) => {
+                let task = toml_task(doc, index).context("任务索引超出范围")?;
+                let mut task = task.clone();
+                enable_toml_task(&mut task);
+                let mut tasks = ArrayOfTables::new();
+                tasks.push(task);
+                let mut out = DocumentMut::new();
+                out.insert("tasks", Item::ArrayOfTables(tasks));
+                Ok(("toml".to_string(), out.to_string()))
+            }
+            (ConfigFormat::Json, ConfigData::Structured(root)) => Ok((
+                "json".to_string(),
+                format!(
+                    "{}\n",
+                    serde_json::to_string_pretty(&single_task_value(root, index)?)?
+                ),
+            )),
+            (ConfigFormat::Yaml, ConfigData::Structured(root)) => Ok((
+                "yaml".to_string(),
+                serde_yaml::to_string(&single_task_value(root, index)?)?,
+            )),
+            _ => bail!("配置格式与数据不匹配"),
+        }
+    }
+
     pub fn task_name(&self, index: usize) -> Option<String> {
         self.task_value(index, "name")
             .and_then(|value| match value {
@@ -801,6 +851,35 @@ fn default_task_name(task_type: &str) -> &'static str {
     }
 }
 
+/// 强制任务参数中 `enable = true`，保证单独执行时即使原配置关闭也会运行。
+fn enable_toml_task(task: &mut Table) {
+    if let Some(params) = task.get_mut("params").and_then(Item::as_table_like_mut) {
+        params.insert("enable", value(true));
+    } else {
+        let mut params = InlineTable::new();
+        params.insert("enable", true.into());
+        task.insert("params", value(params));
+    }
+}
+
+/// 提取单个任务并强制 `enable = true`，包装为 `{ "tasks": [task] }`。
+fn single_task_value(root: &JsonValue, index: usize) -> Result<JsonValue> {
+    let task = json_task(root, index).context("任务索引超出范围")?;
+    let mut task = task.clone();
+    let params = task
+        .entry("params")
+        .or_insert_with(|| JsonValue::Object(JsonMap::new()));
+    if let JsonValue::Object(params) = params {
+        params.insert("enable".to_string(), JsonValue::Bool(true));
+    }
+    let mut wrapper = JsonMap::new();
+    wrapper.insert(
+        "tasks".to_string(),
+        JsonValue::Array(vec![JsonValue::Object(task)]),
+    );
+    Ok(JsonValue::Object(wrapper))
+}
+
 fn toml_tasks_mut(doc: &mut DocumentMut) -> Result<&mut ArrayOfTables> {
     doc.get_mut("tasks")
         .and_then(Item::as_array_of_tables_mut)
@@ -1018,6 +1097,42 @@ params = { stage = "1-7", custom_param = "keep" }
         assert!(saved.contains("custom_param = \"keep\""));
         assert!(saved.contains("stage = \"CE-6\""));
         assert!(saved.contains("enable = false"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn single_task_file_contains_only_selected_task_and_forces_enable() {
+        let dir = temp_dir();
+        let tasks_dir = dir.join("tasks");
+        let path = dir.join("daily.toml");
+        fs::write(
+            &path,
+            r#"[[tasks]]
+name = "刷理智"
+type = "Fight"
+params = { enable = false, stage = "1-7" }
+
+[[tasks]]
+name = "公招"
+type = "Recruit"
+params = { enable = true, times = 4 }
+"#,
+        )
+        .unwrap();
+
+        let config = DailyConfig::load(&path).unwrap();
+        let (file, base) = config.write_single_task_file_into(1, &tasks_dir).unwrap();
+        assert!(base.starts_with("maatui-single-daily-"));
+
+        let content = fs::read_to_string(&file).unwrap();
+        assert!(content.contains("公招"));
+        assert!(!content.contains("刷理智"));
+        assert!(content.contains("enable = true"));
+
+        // 生成的临时文件可被重新加载，且只包含一个已启用任务。
+        let reloaded = DailyConfig::load(&file).unwrap();
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(reloaded.task_enabled(0), Some(true));
         fs::remove_dir_all(dir).unwrap();
     }
 

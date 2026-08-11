@@ -11,6 +11,7 @@ use crate::app::{
     App, CopilotDetailDialog, CopilotSection, EditorSection, InputDialog, LogScope, MainMenuItem,
     Screen, SelectDialog, TASK_TYPES, TaskPhase, variant_fields,
 };
+use crate::copilot::ImportKind;
 use crate::runner::LogLevel;
 use crate::shortcuts::{ShortcutHint, hints as shortcut_hints_for};
 
@@ -771,37 +772,83 @@ fn shortcut_help_title(app: &App) -> String {
 
 fn input_dialog_hint(input: &InputDialog) -> &'static str {
     if input.allows_import_kind_switch() {
-        "  Enter 确认 · Esc 取消 · Ctrl+U 清空 · ←/→ 切换添加类型"
+        "  Enter 确认 · Esc 取消 · Ctrl+U 清空 · ← 作业集 · → 单个作业"
     } else {
         "  Enter 确认 · Esc 取消 · Ctrl+U 清空"
     }
 }
 
+fn import_kind_span(label: &'static str, selected: bool) -> Span<'static> {
+    if selected {
+        Span::styled(
+            format!(" ● {label} "),
+            Style::default()
+                .fg(Color::Black)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(format!(" ○ {label} "), Style::default().fg(MUTED))
+    }
+}
+
+fn input_dialog_placeholder(input: &InputDialog) -> &'static str {
+    match input.import_kind() {
+        Some(ImportKind::Set) => "prts://s12345 / 12345",
+        Some(ImportKind::Single) => "prts://12345 / 12345",
+        None => "",
+    }
+}
+
 fn draw_input_dialog(frame: &mut Frame, area: Rect, input: &InputDialog) {
-    let popup = centered_rect(76, 7, area);
+    let is_batch_import = input.allows_import_kind_switch();
+    let popup = centered_rect(76, if is_batch_import { 9 } else { 7 }, area);
+    let mut lines = vec![Line::from("")];
+    if is_batch_import {
+        let kind = input.import_kind().unwrap_or(ImportKind::Set);
+        lines.push(Line::from(vec![
+            Span::styled("  添加类型  ", Style::default().fg(MUTED)),
+            import_kind_span("作业集", kind == ImportKind::Set),
+            Span::raw("  "),
+            import_kind_span("单个作业", kind == ImportKind::Single),
+        ]));
+        lines.push(Line::from(Span::styled(
+            match kind {
+                ImportKind::Set => "  添加完整作业集",
+                ImportKind::Single => "  向批量列表追加单个作业",
+            },
+            Style::default().fg(Color::White),
+        )));
+        lines.push(Line::from(""));
+    }
+    let mut input_line = vec![Span::styled(
+        "  > ",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )];
+    if input.value.is_empty() {
+        input_line.push(Span::styled("█", Style::default().fg(ACCENT)));
+        input_line.push(Span::styled(
+            input_dialog_placeholder(input),
+            Style::default().fg(MUTED),
+        ));
+    } else {
+        input_line.push(Span::styled(
+            &input.value,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::UNDERLINED),
+        ));
+        input_line.push(Span::styled("█", Style::default().fg(ACCENT)));
+    }
+    lines.push(Line::from(input_line));
+    lines.push(Line::from(Span::styled(
+        input_dialog_hint(input),
+        Style::default().fg(MUTED),
+    )));
+
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(""),
-            Line::from(vec![
-                Span::styled(
-                    "  > ",
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    &input.value,
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::UNDERLINED),
-                ),
-                Span::styled("█", Style::default().fg(ACCENT)),
-            ]),
-            Line::from(Span::styled(
-                input_dialog_hint(input),
-                Style::default().fg(MUTED),
-            )),
-        ])
-        .block(
+        Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(ACCENT))
@@ -1159,7 +1206,6 @@ fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
 mod tests {
     use super::*;
     use crate::app::{CopilotTextField, ImportDestination, InputDialog, InputTarget};
-    use crate::copilot::ImportKind;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -1263,7 +1309,7 @@ mod tests {
             target: InputTarget::CopilotText(CopilotTextField::SupportName),
         };
         let batch = InputDialog {
-            title: "添加作业".to_string(),
+            title: "添加到作业集".to_string(),
             value: String::new(),
             target: InputTarget::CopilotAdd {
                 kind: ImportKind::Set,
@@ -1271,8 +1317,58 @@ mod tests {
             },
         };
 
-        assert!(!input_dialog_hint(&normal).contains("切换添加类型"));
-        assert!(input_dialog_hint(&batch).contains("切换添加类型"));
+        assert!(!input_dialog_hint(&normal).contains("← 作业集"));
+        assert!(input_dialog_hint(&batch).contains("← 作业集"));
+        assert!(input_dialog_hint(&batch).contains("→ 单个作业"));
+    }
+
+    #[test]
+    fn batch_import_dialog_renders_clear_selected_mode_and_placeholder() {
+        let mut input = InputDialog {
+            title: "添加到作业集".to_string(),
+            value: String::new(),
+            target: InputTarget::CopilotAdd {
+                kind: ImportKind::Set,
+                destination: ImportDestination::Batch,
+            },
+        };
+        let backend = TestBackend::new(100, 15);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| draw_input_dialog(frame, frame.area(), &input))
+            .unwrap();
+        let set_text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .filter(|symbol| !symbol.trim().is_empty())
+            .collect::<String>();
+        assert!(set_text.contains("●作业集"));
+        assert!(set_text.contains("○单个作业"));
+        assert!(set_text.contains("添加完整作业集"));
+        assert!(!set_text.contains("当前："));
+        assert!(set_text.contains(">█prts://s12345/12345"));
+
+        input.select_batch_import_kind(ImportKind::Single);
+        terminal
+            .draw(|frame| draw_input_dialog(frame, frame.area(), &input))
+            .unwrap();
+        let single_text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .filter(|symbol| !symbol.trim().is_empty())
+            .collect::<String>();
+        assert!(single_text.contains("○作业集"));
+        assert!(single_text.contains("●单个作业"));
+        assert!(single_text.contains("向批量列表追加"));
+        assert!(!single_text.contains("当前："));
+        assert!(single_text.contains(">█prts://12345/12345"));
     }
 
     #[test]

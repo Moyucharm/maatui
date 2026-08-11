@@ -105,6 +105,7 @@ impl App {
             shortcut_help_open: false,
             shortcut_help_scroll: 0,
             run_progress: None,
+            temp_task_file: None,
             task: None,
             daily_run: None,
             pending_resource_check: false,
@@ -480,6 +481,29 @@ impl App {
                 }
             }
             Some(Action::Reload) => self.reload_config(),
+            Some(Action::RunDailySingle) => {
+                if len == 0 {
+                    return;
+                }
+                let index = self.config_idx;
+                let Some(config) = self.config.as_ref() else {
+                    return;
+                };
+                let name = config
+                    .task_name(index)
+                    .unwrap_or_else(|| format!("任务 {}", index + 1));
+                match config.write_single_task_file(index) {
+                    Ok((path, basename)) => {
+                        let command = TaskCommand::daily_single(index, &name, &basename, path);
+                        // 跳转到每日任务执行页显示日志。
+                        self.screen = Screen::Daily;
+                        self.start_command(command);
+                    }
+                    Err(error) => {
+                        self.status_error(format!("生成单任务配置失败: {error}"));
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -748,7 +772,7 @@ impl App {
             }
             Some(Action::Add) => {
                 self.open_input(
-                    "添加作业集  |  → 添加单个作业".to_string(),
+                    "添加到作业集".to_string(),
                     String::new(),
                     InputTarget::CopilotAdd {
                         kind: ImportKind::Set,
@@ -994,28 +1018,24 @@ impl App {
         match key.code {
             KeyCode::Esc => self.input = None,
             KeyCode::Enter => self.commit_input(),
-            KeyCode::Left | KeyCode::Right
-                if self.input.as_ref().is_some_and(|input| {
-                    matches!(
-                        input.target,
-                        InputTarget::CopilotAdd {
-                            destination: ImportDestination::Batch,
-                            ..
-                        }
-                    )
-                }) =>
+            KeyCode::Left
+                if self
+                    .input
+                    .as_ref()
+                    .is_some_and(InputDialog::allows_import_kind_switch) =>
             {
-                if let Some(input) = self.input.as_mut()
-                    && let InputTarget::CopilotAdd { kind, .. } = &mut input.target
-                {
-                    *kind = match *kind {
-                        ImportKind::Set => ImportKind::Single,
-                        ImportKind::Single => ImportKind::Set,
-                    };
-                    input.title = match *kind {
-                        ImportKind::Set => "添加作业集  |  → 添加单个作业".to_string(),
-                        ImportKind::Single => "← 添加作业集  |  添加单个作业".to_string(),
-                    };
+                if let Some(input) = self.input.as_mut() {
+                    input.select_batch_import_kind(ImportKind::Set);
+                }
+            }
+            KeyCode::Right
+                if self
+                    .input
+                    .as_ref()
+                    .is_some_and(InputDialog::allows_import_kind_switch) =>
+            {
+                if let Some(input) = self.input.as_mut() {
+                    input.select_batch_import_kind(ImportKind::Single);
                 }
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1994,19 +2014,35 @@ impl App {
         self.saw_outdated_resource_error = false;
         self.saw_ocr_to_t0_error = false;
         if command.tracks_daily_progress() {
-            let tasks = self
-                .config
-                .as_ref()
-                .map(DailyConfig::task_summaries)
-                .unwrap_or_default();
-            let total = tasks.len();
+            let (tasks, total) = match command.daily_single_index {
+                Some(index) => {
+                    let tasks = self
+                        .config
+                        .as_ref()
+                        .and_then(|config| config.task_summary(index))
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    // 用户主动单独执行，即使原配置关闭也按单个任务计。
+                    (tasks, 1)
+                }
+                None => {
+                    let tasks = self
+                        .config
+                        .as_ref()
+                        .map(DailyConfig::task_summaries)
+                        .unwrap_or_default();
+                    let total = tasks.iter().filter(|task| task.enabled).count();
+                    (tasks, total)
+                }
+            };
             self.run_progress = Some(RunProgress {
                 current: 0,
                 total,
                 label: "等待任务开始".to_string(),
             });
-            self.daily_run = Some(DailyRunState { tasks });
+            self.daily_run = Some(DailyRunState { tasks, total });
         }
+        self.temp_task_file = command.cleanup.clone();
         self.pending_resource_check = is_resource_update_command(&command);
         self.resource_version_before = if self.pending_resource_check {
             read_hot_update_version()
@@ -2029,6 +2065,7 @@ impl App {
             Err(error) => {
                 self.pending_resource_check = false;
                 self.resource_version_before = None;
+                self.remove_temp_task_file();
                 self.push_log(LogLevel::Error, error);
                 self.status_text = "启动失败".to_string();
                 self.last_failed = true;
@@ -2136,29 +2173,32 @@ impl App {
         let Some(state) = self.daily_run.as_ref() else {
             return;
         };
-        let total = state.tasks.len();
+        let total = state.total;
+        // 防御：当前进度不超过分母（taskid 语义在不同 maa 版本下可能保留关闭任务的序号）。
+        let current = task_id.min(total);
         let index = task_id.saturating_sub(1);
-        let (current, label, mismatch) = state.tasks.get(index).map_or_else(
-            || {
-                (
-                    task_id.min(total),
-                    task_type_label(taskchain).to_string(),
-                    true,
-                )
-            },
-            |task| (task_id, task.name.clone(), task.task_type != taskchain),
-        );
+        let enabled_index = current.saturating_sub(1);
+        // 优先按实际启用任务顺序取名称，避免关闭任务穿插及同类型任务重复时错位；
+        // 若回调使用原配置索引，则退回原始索引匹配，最后使用任务类型标签。
+        let label = state
+            .tasks
+            .iter()
+            .filter(|task| task.enabled)
+            .nth(enabled_index)
+            .filter(|task| task.task_type == taskchain)
+            .or_else(|| {
+                state
+                    .tasks
+                    .get(index)
+                    .filter(|task| task.task_type == taskchain)
+            })
+            .map(|task| task.name.clone())
+            .unwrap_or_else(|| task_type_label(taskchain).to_string());
         self.run_progress = Some(RunProgress {
             current,
             total,
             label,
         });
-        if mismatch {
-            self.push_log(
-                LogLevel::Warn,
-                format!("每日任务进度映射不一致: taskid={task_id}, taskchain={taskchain}"),
-            );
-        }
     }
 
     fn on_copilot_stage_succeeded(&mut self) {
@@ -2237,6 +2277,7 @@ impl App {
     }
 
     fn on_exited(&mut self, code: Option<i32>, stopped: bool) {
+        self.remove_temp_task_file();
         let code_text = code.map_or_else(|| "?".to_string(), |code| code.to_string());
         let check_resource = self.pending_resource_check;
         let version_before = self.resource_version_before.take();
@@ -2353,6 +2394,18 @@ impl App {
         }
     }
 
+    /// 删除单任务执行生成的临时任务文件；删除失败仅记录日志，不阻断。
+    fn remove_temp_task_file(&mut self) {
+        if let Some(path) = self.temp_task_file.take()
+            && let Err(error) = fs::remove_file(&path)
+        {
+            self.push_log(
+                LogLevel::Warn,
+                format!("清理临时任务文件失败 {}: {error}", path.display()),
+            );
+        }
+    }
+
     pub fn cleanup(&mut self) {
         if let Some(task) = self.task.take() {
             task.force_cleanup();
@@ -2360,6 +2413,7 @@ impl App {
         if let Some(batch) = self.copilot_batch.take() {
             remove_batch_task(batch.task_path());
         }
+        self.remove_temp_task_file();
         self.phase = TaskPhase::Idle;
     }
 
@@ -3312,6 +3366,7 @@ mod tests {
                     enabled: false,
                 },
             ],
+            total: 1,
         });
 
         app.on_daily_task_started(2, "CloseDown");
@@ -3319,9 +3374,78 @@ mod tests {
         assert_eq!(
             app.run_progress,
             Some(RunProgress {
+                current: 1,
+                total: 1,
+                label: "关闭游戏".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn daily_progress_matches_label_by_taskchain_when_disabled_in_between() {
+        let mut app = App::new();
+        app.daily_run = Some(DailyRunState {
+            tasks: vec![
+                TaskSummary {
+                    name: "启动游戏".to_string(),
+                    task_type: "StartUp".to_string(),
+                    enabled: true,
+                },
+                TaskSummary {
+                    name: "刷理智".to_string(),
+                    task_type: "Fight".to_string(),
+                    enabled: false,
+                },
+                TaskSummary {
+                    name: "公招".to_string(),
+                    task_type: "Recruit".to_string(),
+                    enabled: true,
+                },
+            ],
+            total: 2,
+        });
+
+        // taskid=2 对应实际执行的第二个启用任务「公招」，
+        // 不应错位显示为中间关闭的「刷理智」。
+        app.on_daily_task_started(2, "Recruit");
+
+        assert_eq!(
+            app.run_progress,
+            Some(RunProgress {
                 current: 2,
                 total: 2,
-                label: "关闭游戏".to_string(),
+                label: "公招".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn daily_progress_distinguishes_enabled_tasks_with_same_type() {
+        let mut app = App::new();
+        app.daily_run = Some(DailyRunState {
+            tasks: vec![
+                TaskSummary {
+                    name: "常驻关卡".to_string(),
+                    task_type: "Fight".to_string(),
+                    enabled: true,
+                },
+                TaskSummary {
+                    name: "活动关卡".to_string(),
+                    task_type: "Fight".to_string(),
+                    enabled: true,
+                },
+            ],
+            total: 2,
+        });
+
+        app.on_daily_task_started(2, "Fight");
+
+        assert_eq!(
+            app.run_progress,
+            Some(RunProgress {
+                current: 2,
+                total: 2,
+                label: "活动关卡".to_string(),
             })
         );
     }
@@ -3421,7 +3545,7 @@ mod tests {
     fn input_clear_and_batch_import_type_switch_keep_text() {
         let mut app = App::new();
         app.input = Some(InputDialog {
-            title: "添加作业集  |  → 添加单个作业".to_string(),
+            title: "添加到作业集".to_string(),
             value: "prts://123".to_string(),
             target: InputTarget::CopilotAdd {
                 kind: ImportKind::Set,
@@ -3429,6 +3553,7 @@ mod tests {
             },
         });
 
+        app.handle_input_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         app.handle_input_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         assert_eq!(app.input.as_ref().unwrap().value, "prts://123");
         assert!(matches!(
@@ -3438,9 +3563,10 @@ mod tests {
                 destination: ImportDestination::Batch,
             })
         ));
-        app.handle_input_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        assert!(app.input.as_ref().unwrap().value.is_empty());
+
         app.handle_input_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        app.handle_input_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.input.as_ref().unwrap().value, "prts://123");
         assert!(matches!(
             app.input.as_ref().map(|input| &input.target),
             Some(InputTarget::CopilotAdd {
@@ -3448,6 +3574,9 @@ mod tests {
                 destination: ImportDestination::Batch,
             })
         ));
+
+        app.handle_input_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(app.input.as_ref().unwrap().value.is_empty());
     }
 
     #[test]

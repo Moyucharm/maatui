@@ -1,6 +1,7 @@
 //! 应用状态模型与对话框数据。
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
 
@@ -20,6 +21,8 @@ pub struct RunProgress {
 #[derive(Debug, Clone)]
 pub(super) struct DailyRunState {
     pub(super) tasks: Vec<TaskSummary>,
+    /// 进度分母：仅统计启用的任务。
+    pub(super) total: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,6 +299,23 @@ impl InputDialog {
             }
         )
     }
+
+    pub fn import_kind(&self) -> Option<ImportKind> {
+        match self.target {
+            InputTarget::CopilotAdd { kind, .. } => Some(kind),
+            _ => None,
+        }
+    }
+
+    pub fn select_batch_import_kind(&mut self, selected: ImportKind) {
+        if let InputTarget::CopilotAdd {
+            kind,
+            destination: ImportDestination::Batch,
+        } = &mut self.target
+        {
+            *kind = selected;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -407,6 +427,8 @@ pub struct App {
     pub run_progress: Option<RunProgress>,
     pub(super) task: Option<RunningTask>,
     pub(super) daily_run: Option<DailyRunState>,
+    /// 单任务执行生成的临时任务文件，运行结束后删除。
+    pub(super) temp_task_file: Option<PathBuf>,
     pub(super) pending_resource_check: bool,
     pub(super) resource_version_before: Option<HotUpdateVersion>,
     pub(super) saw_outdated_resource_error: bool,

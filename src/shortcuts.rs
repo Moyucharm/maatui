@@ -64,6 +64,7 @@ pub enum Action {
     Delete,
     Reload,
     RunDaily,
+    RunDailySingle,
     OpenConfig,
     PreviousEditorSection,
     NextEditorSection,
@@ -103,6 +104,7 @@ impl Action {
             Self::Delete => key.code == KeyCode::Char('d'),
             Self::Reload => key.code == KeyCode::Char('r'),
             Self::RunDaily => key.code == KeyCode::Char('r'),
+            Self::RunDailySingle => key.code == KeyCode::Char('x'),
             Self::OpenConfig => key.code == KeyCode::Char('c'),
             Self::PreviousEditorSection => {
                 matches!(key.code, KeyCode::Left | KeyCode::Char('h'))
@@ -228,6 +230,14 @@ const DAILY: &[ActionSpec] = &[
     shown(Action::OpenConfig, "编辑", "c", "配置", "打开配置管理", 4),
 ];
 const CONFIG: &[ActionSpec] = &[
+    shown(
+        Action::RunDailySingle,
+        "运行",
+        "x",
+        "单跑",
+        "单独执行当前选中的任务",
+        0,
+    ),
     shown(
         Action::MoveUp,
         "编辑",
@@ -526,13 +536,31 @@ mod tests {
             "Home/End" => (KeyCode::Home, KeyModifiers::NONE),
             "Space" => (KeyCode::Char(' '), KeyModifiers::NONE),
             "e/a" => (KeyCode::Char('e'), KeyModifiers::NONE),
-            "a" | "c" | "d" | "i" | "r" | "t" | "v" => (
+            "a" | "c" | "d" | "i" | "r" | "t" | "v" | "x" => (
                 KeyCode::Char(key.chars().next().unwrap()),
                 KeyModifiers::NONE,
             ),
             unknown => panic!("缺少快捷键测试映射: {unknown}"),
         };
         KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn config_single_run_uses_plain_x() {
+        assert_eq!(
+            action_for(
+                ShortcutContext::Config,
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            ),
+            Some(Action::RunDailySingle)
+        );
+        assert_ne!(
+            action_for(
+                ShortcutContext::Config,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            ),
+            Some(Action::RunDailySingle)
+        );
     }
 
     #[test]

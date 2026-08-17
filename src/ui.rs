@@ -617,7 +617,7 @@ fn draw_running_control(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         OK
     };
-    let stop = "[ Enter / s ] 停止任务";
+    let stop = "[ Esc / Enter / s ] 停止任务";
     let inner_width = area.width.saturating_sub(2) as usize;
     let progress_width = inner_width.saturating_sub(stop.width());
     let progress = if progress_width > 2 {

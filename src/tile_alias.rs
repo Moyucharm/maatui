@@ -4,6 +4,7 @@
 //! 而资源仓库里的文件名多为 `act53side_01-...json`，作业却写 `TO-1`。
 //! 在 overview.json 基础上为缺失前缀的 code 建相对符号链接。
 
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -136,7 +137,9 @@ fn ensure_aliases_from_overview(dir: &Path, raw: &str) -> io::Result<(usize, usi
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .collect();
+    names.sort_unstable();
 
+    let mut created_codes = HashSet::new();
     let mut created = 0usize;
     let mut skipped = 0usize;
 
@@ -163,10 +166,7 @@ fn ensure_aliases_from_overview(dir: &Path, raw: &str) -> io::Result<(usize, usi
             skipped += 1;
             continue;
         }
-        if names
-            .iter()
-            .any(|name| filename_matches_stage_code(name, code))
-        {
+        if created_codes.contains(code) || has_stage_code_file(&names, code) {
             skipped += 1;
             continue;
         }
@@ -174,7 +174,7 @@ fn ensure_aliases_from_overview(dir: &Path, raw: &str) -> io::Result<(usize, usi
         let link = dir.join(format!("{code}.json"));
         match std::os::unix::fs::symlink(filename, &link) {
             Ok(()) => {
-                names.push(link.file_name().unwrap().to_string_lossy().into_owned());
+                created_codes.insert(code.to_string());
                 created += 1;
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => skipped += 1,
@@ -183,6 +183,14 @@ fn ensure_aliases_from_overview(dir: &Path, raw: &str) -> io::Result<(usize, usi
     }
 
     Ok((created, skipped))
+}
+
+fn has_stage_code_file(names: &[String], code: &str) -> bool {
+    let start = names.partition_point(|name| name.as_str() < code);
+    names[start..]
+        .iter()
+        .take_while(|name| name.starts_with(code))
+        .any(|name| filename_matches_stage_code(name, code))
 }
 
 fn filename_matches_stage_code(name: &str, code: &str) -> bool {
@@ -308,6 +316,23 @@ mod tests {
         assert!(filename_matches_stage_code("1-1-level.json", "1-1"));
         assert!(!filename_matches_stage_code("1-10-level.json", "1-1"));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn indexed_stage_lookup_handles_many_nearby_names() {
+        let mut names = (0..5000)
+            .map(|index| format!("unrelated-{index:04}.json"))
+            .collect::<Vec<_>>();
+        names.extend([
+            "TO-10-level.json".to_string(),
+            "TO-1_level.json".to_string(),
+        ]);
+        names.sort_unstable();
+
+        assert!(has_stage_code_file(&names, "TO-1"));
+        assert!(!has_stage_code_file(&names, "TO-2"));
+        assert!(filename_matches_stage_code("TO-1_level.json", "TO-1"));
+        assert!(!filename_matches_stage_code("TO-10-level.json", "TO-1"));
     }
 
     #[test]

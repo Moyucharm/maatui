@@ -38,6 +38,30 @@ pub fn maa_data_dir() -> Result<PathBuf> {
     )
 }
 
+pub fn maa_log_dir() -> Result<PathBuf> {
+    Ok(resolve_maa_state_dir(
+        std::env::var_os("MAA_STATE_DIR"),
+        std::env::var_os("XDG_STATE_HOME"),
+        std::env::var_os("HOME"),
+    )?
+    .join("debug"))
+}
+
+fn resolve_maa_state_dir(
+    maa_state_dir: Option<std::ffi::OsString>,
+    xdg_state_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Result<PathBuf> {
+    if let Some(dir) = maa_state_dir {
+        return Ok(PathBuf::from(dir));
+    }
+    if let Some(dir) = xdg_state_home {
+        return Ok(PathBuf::from(dir).join("maa"));
+    }
+    let home = home.context("无法确定 HOME，且未设置 MAA_STATE_DIR/XDG_STATE_HOME")?;
+    Ok(PathBuf::from(home).join(".local/state/maa"))
+}
+
 fn resolve_maa_data_dir(
     maa_data_dir: Option<std::ffi::OsString>,
     xdg_data_home: Option<std::ffi::OsString>,
@@ -157,7 +181,35 @@ mod tests {
     }
 
     #[test]
-    fn resolves_xdg_and_override_directories() {
+    fn resolves_state_directories() {
+        assert_eq!(
+            resolve_maa_state_dir(
+                Some("/custom/state".into()),
+                Some("/xdg/state".into()),
+                None,
+            )
+            .unwrap(),
+            PathBuf::from("/custom/state")
+        );
+        assert_eq!(
+            resolve_maa_state_dir(None, Some("/xdg/state".into()), Some("/home/me".into()))
+                .unwrap(),
+            PathBuf::from("/xdg/state/maa")
+        );
+        assert_eq!(
+            resolve_maa_state_dir(None, None, Some("/home/me".into())).unwrap(),
+            PathBuf::from("/home/me/.local/state/maa")
+        );
+        assert_eq!(
+            resolve_maa_state_dir(None, None, None)
+                .unwrap_err()
+                .to_string(),
+            "无法确定 HOME，且未设置 MAA_STATE_DIR/XDG_STATE_HOME"
+        );
+    }
+
+    #[test]
+    fn resolves_config_and_data_directories() {
         assert_eq!(
             resolve_maa_config_dir(None, Some("/xdg/config".into()), Some("/home/me".into()))
                 .unwrap(),

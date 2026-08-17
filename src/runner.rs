@@ -4,7 +4,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 use libc::{SIGKILL, SIGTERM, kill, pid_t};
 use serde_json::Value as JsonValue;
 use strip_ansi_escapes::strip_str;
+
+use crate::storage::maa_log_dir;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
@@ -168,26 +170,12 @@ enum CoreProgressEvent {
 }
 
 impl CoreLogCursor {
-    fn prepare(program: &str, track_daily: bool, track_copilot: bool) -> Result<Self, String> {
-        let output = Command::new(program)
-            .args(["dir", "log"])
-            .output()
-            .map_err(|error| format!("无法定位 MaaCore 日志目录: {error}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "无法定位 MaaCore 日志目录: maa dir log exit {}",
-                output
-                    .status
-                    .code()
-                    .map_or_else(|| "?".to_string(), |code| code.to_string())
-            ));
-        }
-        let dir = String::from_utf8(output.stdout)
-            .map_err(|_| "maa dir log 返回了非 UTF-8 路径".to_string())?;
-        let dir = PathBuf::from(dir.trim());
-        if dir.as_os_str().is_empty() {
-            return Err("maa dir log 返回了空路径".to_string());
-        }
+    fn prepare(track_daily: bool, track_copilot: bool) -> Result<Self, String> {
+        let dir = maa_log_dir().map_err(|error| format!("无法定位 MaaCore 日志目录: {error}"))?;
+        Self::prepare_in_dir(&dir, track_daily, track_copilot)
+    }
+
+    fn prepare_in_dir(dir: &Path, track_daily: bool, track_copilot: bool) -> Result<Self, String> {
         let path = dir.join("asst.log");
         let backup_path = dir.join("asst.bak.log");
         let (offset, identity) = match fs::metadata(&path) {
@@ -332,7 +320,7 @@ impl RunningTask {
         let track_daily = command.tracks_daily_progress();
         let track_copilot = command.tracks_copilot_progress();
         let core_log = (track_daily || track_copilot)
-            .then(|| CoreLogCursor::prepare(&command.program, track_daily, track_copilot))
+            .then(|| CoreLogCursor::prepare(track_daily, track_copilot))
             .transpose()?;
         Self::spawn_command_with_env(
             &command.program,
@@ -671,6 +659,25 @@ mod tests {
                 .parse_progress_line(&line.replace("Px321", "Px999"))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn core_log_cursor_starts_after_existing_log_content() {
+        let dir = temp_dir();
+        let path = dir.join("asst.log");
+        fs::write(&path, "history\n").unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+
+        let cursor = CoreLogCursor::prepare_in_dir(&dir, true, false).unwrap();
+
+        assert_eq!(cursor.offset, metadata.len());
+        assert_eq!(
+            cursor.identity,
+            Some(FileIdentity::from_metadata(&metadata))
+        );
+        assert_eq!(cursor.path, path);
+        assert_eq!(cursor.backup_path, dir.join("asst.bak.log"));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -123,8 +123,8 @@ impl Action {
             Self::RunBatch => key.code == KeyCode::Char('r'),
             Self::ToggleAll => key.code == KeyCode::Char('t'),
             Self::Clear => key.code == KeyCode::Char('c'),
-            Self::Stop => matches!(key.code, KeyCode::Enter | KeyCode::Char('s')),
-            Self::QuitRunning => matches!(key.code, KeyCode::Esc | KeyCode::Char('q')),
+            Self::Stop => matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('s')),
+            Self::QuitRunning => key.code == KeyCode::Char('q'),
             Self::LogPageUp => key.code == KeyCode::PageUp,
             Self::LogPageDown => key.code == KeyCode::PageDown,
             Self::LogHome => key.code == KeyCode::Home,
@@ -173,7 +173,14 @@ const fn hidden(action: Action) -> ActionSpec {
 }
 
 const RUNNING: &[ActionSpec] = &[
-    shown(Action::Stop, "运行", "Enter/s", "停止", "停止当前任务", 0),
+    shown(
+        Action::Stop,
+        "运行",
+        "Esc/Enter/s",
+        "停止",
+        "停止当前任务",
+        0,
+    ),
     shown(
         Action::LogPageUp,
         "导航",
@@ -186,7 +193,7 @@ const RUNNING: &[ActionSpec] = &[
     shown(
         Action::QuitRunning,
         "运行",
-        "q/Esc",
+        "q",
         "退出",
         "停止任务并退出",
         3,
@@ -526,8 +533,10 @@ mod tests {
 
     fn advertised_key(key: &str) -> KeyEvent {
         let (code, modifiers) = match key {
-            "Enter" | "Enter/e" | "Enter/s" => (KeyCode::Enter, KeyModifiers::NONE),
+            "Enter" | "Enter/e" => (KeyCode::Enter, KeyModifiers::NONE),
             "Esc/q" | "q/Esc" => (KeyCode::Esc, KeyModifiers::NONE),
+            "Esc/Enter/s" => (KeyCode::Esc, KeyModifiers::NONE),
+            "q" => (KeyCode::Char('q'), KeyModifiers::NONE),
             "↑↓/jk" => (KeyCode::Up, KeyModifiers::NONE),
             "Shift+↑↓" => (KeyCode::Up, KeyModifiers::SHIFT),
             "←→/hl" => (KeyCode::Left, KeyModifiers::NONE),
@@ -560,6 +569,24 @@ mod tests {
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
             ),
             Some(Action::RunDailySingle)
+        );
+    }
+
+    #[test]
+    fn running_escape_stops_without_quitting() {
+        assert_eq!(
+            action_for(
+                ShortcutContext::Running,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            ),
+            Some(Action::Stop)
+        );
+        assert_eq!(
+            action_for(
+                ShortcutContext::Running,
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            ),
+            Some(Action::QuitRunning)
         );
     }
 

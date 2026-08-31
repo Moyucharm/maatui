@@ -2,10 +2,10 @@
 
 use std::time::Duration;
 
-pub const USER_AGENT: &str = "MaaTUI/0.1";
+pub(crate) const USER_AGENT: &str = "MaaTUI/0.1";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub fn agent() -> ureq::Agent {
+pub(crate) fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
         .timeout_read(REQUEST_TIMEOUT)

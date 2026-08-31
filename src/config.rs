@@ -1,4 +1,4 @@
-//! maa-cli `daily` 配置的定位、无损编辑与原子保存。
+//! maa-cli `daily` 配置的定位、格式保留编辑与原子保存。
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,102 +9,37 @@ use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, val
 
 use crate::storage::{atomic_write, maa_config_dir};
 
+mod document;
+mod model;
+mod validation;
+
+use document::{ConfigData, ConfigFormat, ConfigStore, NodePath};
+pub use model::{FieldValue, TaskSummary};
+use validation::{validate_json_task, validate_toml_task};
+
 const DAILY_EXTENSIONS: [&str; 4] = ["toml", "yaml", "yml", "json"];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConfigFormat {
-    Toml,
-    Yaml,
-    Json,
-}
-
-#[derive(Debug, Clone)]
-enum ConfigData {
-    Toml(DocumentMut),
-    Structured(JsonValue),
-}
 
 #[derive(Debug)]
 pub struct DailyConfig {
     path: PathBuf,
+    trusted_root: PathBuf,
     format: ConfigFormat,
     data: ConfigData,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum FieldValue {
-    Bool(bool),
-    Integer(i64),
-    Float(f64),
-    String(String),
-    StringArray(Vec<String>),
-    IntegerArray(Vec<i64>),
-}
-
-impl FieldValue {
-    pub fn display(&self) -> String {
-        match self {
-            Self::Bool(value) => if *value { "开" } else { "关" }.to_string(),
-            Self::Integer(value) => value.to_string(),
-            Self::Float(value) => value.to_string(),
-            Self::String(value) => value.clone(),
-            Self::StringArray(values) => values.join(", "),
-            Self::IntegerArray(values) => values
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", "),
-        }
-    }
-
-    pub fn parse_like(input: &str, current: Option<&Self>) -> Result<Self> {
-        match current {
-            Some(Self::Bool(_)) => match input.trim().to_ascii_lowercase().as_str() {
-                "1" | "true" | "on" | "yes" | "开" => Ok(Self::Bool(true)),
-                "0" | "false" | "off" | "no" | "关" => Ok(Self::Bool(false)),
-                _ => bail!("请输入 true/false、on/off 或 开/关"),
-            },
-            Some(Self::Integer(_)) => Ok(Self::Integer(
-                input.trim().parse().context("请输入有效整数")?,
-            )),
-            Some(Self::Float(_)) => {
-                Ok(Self::Float(input.trim().parse().context("请输入有效数字")?))
-            }
-            Some(Self::StringArray(_)) => Ok(Self::StringArray(
-                input
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|item| !item.is_empty())
-                    .map(ToOwned::to_owned)
-                    .collect(),
-            )),
-            Some(Self::IntegerArray(_)) => Ok(Self::IntegerArray(
-                input
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|item| !item.is_empty())
-                    .map(|item| item.parse::<i64>().context("数组中包含无效整数"))
-                    .collect::<Result<Vec<_>>>()?,
-            )),
-            _ => Ok(Self::String(input.to_string())),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct TaskSummary {
-    pub name: String,
-    pub task_type: String,
-    pub enabled: bool,
+    defer_save: bool,
 }
 
 impl DailyConfig {
     pub fn load_default() -> Result<Self> {
         let config_dir = maa_config_dir()?;
-        Self::load_from_tasks_dir(&config_dir.join("tasks"))
+        Self::load_from_tasks_dir_with_root(&config_dir.join("tasks"), &config_dir)
     }
 
+    #[cfg(test)]
     pub fn load_from_tasks_dir(tasks_dir: &Path) -> Result<Self> {
+        Self::load_from_tasks_dir_with_root(tasks_dir, tasks_dir)
+    }
+
+    fn load_from_tasks_dir_with_root(tasks_dir: &Path, trusted_root: &Path) -> Result<Self> {
         let matches: Vec<PathBuf> = DAILY_EXTENSIONS
             .iter()
             .map(|ext| tasks_dir.join(format!("daily.{ext}")))
@@ -113,7 +48,7 @@ impl DailyConfig {
 
         match matches.as_slice() {
             [] => bail!("未找到 daily.toml、daily.yaml、daily.yml 或 daily.json"),
-            [path] => Self::load(path),
+            [path] => Self::load_with_trusted_root(path, trusted_root),
             _ => bail!(
                 "发现多个 daily 配置: {}，请只保留一个",
                 matches
@@ -125,7 +60,16 @@ impl DailyConfig {
         }
     }
 
+    #[cfg(test)]
     pub fn load(path: &Path) -> Result<Self> {
+        let trusted_root = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        Self::load_with_trusted_root(path, trusted_root)
+    }
+
+    fn load_with_trusted_root(path: &Path, trusted_root: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("读取配置失败: {}", path.display()))?;
         let extension = path
@@ -152,24 +96,17 @@ impl DailyConfig {
 
         let config = Self {
             path: path.to_path_buf(),
+            trusted_root: trusted_root.to_path_buf(),
             format,
             data,
+            defer_save: false,
         };
         config.validate_tasks()?;
         Ok(config)
     }
 
     pub fn len(&self) -> usize {
-        match &self.data {
-            ConfigData::Toml(doc) => doc
-                .get("tasks")
-                .and_then(Item::as_array_of_tables)
-                .map_or(0, ArrayOfTables::len),
-            ConfigData::Structured(root) => root
-                .get("tasks")
-                .and_then(JsonValue::as_array)
-                .map_or(0, Vec::len),
-        }
+        self.data.task_count()
     }
 
     pub fn task_summaries(&self) -> Vec<TaskSummary> {
@@ -203,7 +140,7 @@ impl DailyConfig {
         let (extension, content) = self.single_task_content(index)?;
         fs::create_dir_all(tasks_dir)?;
         let path = tasks_dir.join(format!("{basename}.{extension}"));
-        atomic_write(&path, content.as_bytes())?;
+        atomic_write(&path, &self.trusted_root, content.as_bytes())?;
         Ok((path, basename))
     }
 
@@ -343,71 +280,19 @@ impl DailyConfig {
     }
 
     pub fn task_value(&self, index: usize, key: &str) -> Option<FieldValue> {
-        match &self.data {
-            ConfigData::Toml(doc) => toml_task(doc, index)?
-                .get(key)
-                .and_then(field_from_toml_item),
-            ConfigData::Structured(root) => {
-                json_task(root, index)?.get(key).and_then(field_from_json)
-            }
-        }
+        self.data.get(NodePath::TaskField { task: index, key })
     }
 
     pub fn set_task_value(&mut self, index: usize, key: &str, field: FieldValue) -> Result<()> {
-        self.mutate_and_save(|data| {
-            match data {
-                ConfigData::Toml(doc) => {
-                    toml_task_mut(doc, index)?.insert(key, field_to_toml_item(field));
-                }
-                ConfigData::Structured(root) => {
-                    json_task_mut(root, index)?.insert(key.to_string(), field_to_json(field));
-                }
-            }
-            Ok(())
-        })
+        self.mutate_and_save(|data| data.set(NodePath::TaskField { task: index, key }, field))
     }
 
     pub fn param_value(&self, index: usize, key: &str) -> Option<FieldValue> {
-        match &self.data {
-            ConfigData::Toml(doc) => toml_task(doc, index)?
-                .get("params")?
-                .as_table_like()?
-                .get(key)
-                .and_then(field_from_toml_item),
-            ConfigData::Structured(root) => json_task(root, index)?
-                .get("params")?
-                .get(key)
-                .and_then(field_from_json),
-        }
+        self.data.get(NodePath::Param { task: index, key })
     }
 
     pub fn set_param_value(&mut self, index: usize, key: &str, field: FieldValue) -> Result<()> {
-        self.mutate_and_save(|data| {
-            match data {
-                ConfigData::Toml(doc) => {
-                    let task = toml_task_mut(doc, index)?;
-                    if !task.contains_key("params") {
-                        task.insert("params", value(InlineTable::new()));
-                    }
-                    let params = task
-                        .get_mut("params")
-                        .and_then(Item::as_table_like_mut)
-                        .context("params 不是对象")?;
-                    params.insert(key, field_to_toml_item(field));
-                }
-                ConfigData::Structured(root) => {
-                    let task = json_task_mut(root, index)?;
-                    if !task.contains_key("params") {
-                        task.insert("params".to_string(), JsonValue::Object(JsonMap::new()));
-                    }
-                    task.get_mut("params")
-                        .and_then(JsonValue::as_object_mut)
-                        .context("params 不是对象")?
-                        .insert(key.to_string(), field_to_json(field));
-                }
-            }
-            Ok(())
-        })
+        self.mutate_and_save(|data| data.set(NodePath::Param { task: index, key }, field))
     }
 
     pub fn variant_count(&self, task_index: usize) -> usize {
@@ -592,17 +477,11 @@ impl DailyConfig {
         variant_index: usize,
         key: &str,
     ) -> Option<FieldValue> {
-        match &self.data {
-            ConfigData::Toml(doc) => toml_variant(doc, task_index, variant_index)?
-                .get("params")?
-                .as_table_like()?
-                .get(key)
-                .and_then(field_from_toml_item),
-            ConfigData::Structured(root) => json_variant(root, task_index, variant_index)?
-                .get("params")?
-                .get(key)
-                .and_then(field_from_json),
-        }
+        self.data.get(NodePath::VariantParam {
+            task: task_index,
+            variant: variant_index,
+            key,
+        })
     }
 
     pub fn set_variant_param_value(
@@ -613,31 +492,14 @@ impl DailyConfig {
         field: FieldValue,
     ) -> Result<()> {
         self.mutate_and_save(|data| {
-            match data {
-                ConfigData::Toml(doc) => {
-                    let variant = toml_variant_mut(doc, task_index, variant_index)?;
-                    if !variant.contains_key("params") {
-                        variant.insert("params", value(InlineTable::new()));
-                    }
-                    variant
-                        .get_mut("params")
-                        .and_then(Item::as_table_like_mut)
-                        .context("params 不是对象")?
-                        .insert(key, field_to_toml_item(field));
-                }
-                ConfigData::Structured(root) => {
-                    let variant = json_variant_mut(root, task_index, variant_index)?;
-                    if !variant.contains_key("params") {
-                        variant.insert("params".to_string(), JsonValue::Object(JsonMap::new()));
-                    }
-                    variant
-                        .get_mut("params")
-                        .and_then(JsonValue::as_object_mut)
-                        .context("params 不是对象")?
-                        .insert(key.to_string(), field_to_json(field));
-                }
-            }
-            Ok(())
+            data.set(
+                NodePath::VariantParam {
+                    task: task_index,
+                    variant: variant_index,
+                    key,
+                },
+                field,
+            )
         })
     }
 
@@ -647,17 +509,11 @@ impl DailyConfig {
         variant_index: usize,
         key: &str,
     ) -> Option<FieldValue> {
-        match &self.data {
-            ConfigData::Toml(doc) => toml_variant(doc, task_index, variant_index)?
-                .get("condition")?
-                .as_table_like()?
-                .get(key)
-                .and_then(field_from_toml_item),
-            ConfigData::Structured(root) => json_variant(root, task_index, variant_index)?
-                .get("condition")?
-                .get(key)
-                .and_then(field_from_json),
-        }
+        self.data.get(NodePath::VariantCondition {
+            task: task_index,
+            variant: variant_index,
+            key,
+        })
     }
 
     pub fn set_variant_condition_value(
@@ -668,45 +524,43 @@ impl DailyConfig {
         field: FieldValue,
     ) -> Result<()> {
         self.mutate_and_save(|data| {
-            match data {
-                ConfigData::Toml(doc) => {
-                    let variant = toml_variant_mut(doc, task_index, variant_index)?;
-                    if !variant.contains_key("condition") {
-                        variant.insert("condition", value(InlineTable::new()));
-                    }
-                    variant
-                        .get_mut("condition")
-                        .and_then(Item::as_table_like_mut)
-                        .context("condition 不是对象")?
-                        .insert(key, field_to_toml_item(field));
-                }
-                ConfigData::Structured(root) => {
-                    let variant = json_variant_mut(root, task_index, variant_index)?;
-                    if !variant.contains_key("condition") {
-                        variant.insert("condition".to_string(), JsonValue::Object(JsonMap::new()));
-                    }
-                    variant
-                        .get_mut("condition")
-                        .and_then(JsonValue::as_object_mut)
-                        .context("condition 不是对象")?
-                        .insert(key.to_string(), field_to_json(field));
-                }
-            }
-            Ok(())
+            data.set(
+                NodePath::VariantCondition {
+                    task: task_index,
+                    variant: variant_index,
+                    key,
+                },
+                field,
+            )
         })
     }
 
     pub fn save(&self) -> Result<()> {
-        let content = match (&self.format, &self.data) {
+        let content = self.serialize_snapshot()?;
+        atomic_write(&self.path, &self.trusted_root, content.as_bytes())
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn trusted_root(&self) -> &Path {
+        &self.trusted_root
+    }
+
+    pub(crate) fn set_defer_save(&mut self, defer: bool) {
+        self.defer_save = defer;
+    }
+
+    pub(crate) fn serialize_snapshot(&self) -> Result<String> {
+        Ok(match (&self.format, &self.data) {
             (ConfigFormat::Toml, ConfigData::Toml(doc)) => doc.to_string(),
             (ConfigFormat::Json, ConfigData::Structured(root)) => {
                 format!("{}\n", serde_json::to_string_pretty(root)?)
             }
             (ConfigFormat::Yaml, ConfigData::Structured(root)) => serde_yaml::to_string(root)?,
             _ => bail!("配置格式与数据不匹配"),
-        };
-
-        atomic_write(&self.path, content.as_bytes())
+        })
     }
 
     fn mutate_and_save<T>(
@@ -721,7 +575,9 @@ impl DailyConfig {
                 return Err(error);
             }
         };
-        if let Err(error) = self.save() {
+        if !self.defer_save
+            && let Err(error) = self.save()
+        {
             self.data = original;
             return Err(error);
         }
@@ -751,90 +607,6 @@ impl DailyConfig {
         }
         Ok(())
     }
-}
-
-fn validate_toml_task(task: &Table, index: usize) -> Result<()> {
-    task.get("type")
-        .and_then(Item::as_str)
-        .with_context(|| format!("任务 {} 缺少字符串 type", index + 1))?;
-    if let Some(params) = task.get("params")
-        && params.as_table_like().is_none()
-    {
-        bail!("任务 {} 的 params 不是对象", index + 1);
-    }
-    if let Some(variants) = task.get("variants") {
-        let variants = variants
-            .as_array_of_tables()
-            .with_context(|| format!("任务 {} 的 variants 不是表数组", index + 1))?;
-        for (variant_index, variant) in variants.iter().enumerate() {
-            validate_toml_variant(variant, index, variant_index)?;
-        }
-    }
-    Ok(())
-}
-
-fn validate_toml_variant(variant: &Table, task_index: usize, variant_index: usize) -> Result<()> {
-    for key in ["condition", "params"] {
-        if let Some(value) = variant.get(key)
-            && value.as_table_like().is_none()
-        {
-            bail!(
-                "任务 {} 的变体 {} 中 {key} 不是对象",
-                task_index + 1,
-                variant_index + 1
-            );
-        }
-    }
-    Ok(())
-}
-
-fn validate_json_task(task: &JsonValue, index: usize) -> Result<()> {
-    let task = task
-        .as_object()
-        .with_context(|| format!("任务 {} 不是对象", index + 1))?;
-    task.get("type")
-        .and_then(JsonValue::as_str)
-        .with_context(|| format!("任务 {} 缺少字符串 type", index + 1))?;
-    if let Some(params) = task.get("params")
-        && !params.is_object()
-    {
-        bail!("任务 {} 的 params 不是对象", index + 1);
-    }
-    if let Some(variants) = task.get("variants") {
-        let variants = variants
-            .as_array()
-            .with_context(|| format!("任务 {} 的 variants 不是数组", index + 1))?;
-        for (variant_index, variant) in variants.iter().enumerate() {
-            validate_json_variant(variant, index, variant_index)?;
-        }
-    }
-    Ok(())
-}
-
-fn validate_json_variant(
-    variant: &JsonValue,
-    task_index: usize,
-    variant_index: usize,
-) -> Result<()> {
-    let variant = variant.as_object().with_context(|| {
-        format!(
-            "任务 {} 的变体 {} 不是对象",
-            task_index + 1,
-            variant_index + 1
-        )
-    })?;
-    for key in ["condition", "params"] {
-        if let Some(value) = variant.get(key)
-            && !value.is_object()
-        {
-            bail!(
-                "任务 {} 的变体 {} 中 {key} 不是对象",
-                task_index + 1,
-                variant_index + 1
-            );
-        }
-    }
-    Ok(())
 }
 
 fn default_task_name(task_type: &str) -> &'static str {
@@ -1067,6 +839,21 @@ mod tests {
         path
     }
 
+    #[test]
+    fn serialize_snapshot_reports_format_mismatch() {
+        let config = DailyConfig {
+            path: PathBuf::from("daily.toml"),
+            trusted_root: PathBuf::from("."),
+            format: ConfigFormat::Toml,
+            data: ConfigData::Structured(JsonValue::Null),
+            defer_save: true,
+        };
+
+        assert_eq!(
+            config.serialize_snapshot().unwrap_err().to_string(),
+            "配置格式与数据不匹配"
+        );
+    }
     #[test]
     fn edits_toml_without_losing_unknown_fields() {
         let dir = temp_dir();

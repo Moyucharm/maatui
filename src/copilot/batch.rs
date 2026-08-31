@@ -9,7 +9,7 @@ use serde_json::{Value as JsonValue, json};
 
 use super::cache::{CopilotCache, CopilotEntry, CopilotEntrySource};
 use crate::storage::{atomic_write, maatui_cache_dir};
-use crate::tile_alias;
+use crate::tile_alias::StageAliasIndex;
 
 #[derive(Debug, Clone)]
 pub struct CopilotRunOptions {
@@ -41,13 +41,10 @@ pub(crate) fn write_batch_task_in(
     options: &CopilotRunOptions,
     cache_dir: &Path,
 ) -> Result<BatchTask> {
-    write_batch_task_in_with_resolver(
-        cache,
-        indices,
-        options,
-        cache_dir,
-        tile_alias::resolve_stage_code,
-    )
+    let alias_index = StageAliasIndex::load();
+    write_batch_task_in_with_resolver(cache, indices, options, cache_dir, |stage| {
+        alias_index.resolve(stage)
+    })
 }
 
 fn write_batch_task_in_with_resolver(
@@ -130,7 +127,7 @@ fn write_batch_task_in_with_resolver(
             .with_context(|| format!("创建批量任务目录失败: {}", parent.display()))?;
     }
     let content = format!("{}\n", serde_json::to_string_pretty(&task)?);
-    atomic_write(&path, content.as_bytes())?;
+    atomic_write(&path, cache_dir, content.as_bytes())?;
     Ok(BatchTask { path, indices })
 }
 

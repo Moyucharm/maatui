@@ -1,20 +1,14 @@
 //! 子进程控制：启动 `maa`、捕获分级日志、停止进程组。
 
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-use std::os::unix::fs::MetadataExt;
-use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread;
-use std::time::{Duration, Instant};
+mod command;
+mod core_progress;
+mod log;
+mod process;
 
-use libc::{SIGKILL, SIGTERM, kill, pid_t};
-use serde_json::Value as JsonValue;
-use strip_ansi_escapes::strip_str;
-
-use crate::storage::maa_log_dir;
+pub use command::{TaskCommand, TaskKind};
+#[allow(unused_imports)]
+pub use log::classify_log_line;
+pub use process::RunningTask;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
@@ -31,549 +25,23 @@ pub enum LogLevel {
 #[derive(Debug, Clone)]
 pub enum RunnerEvent {
     Line { level: LogLevel, text: String },
+    LogReaderFailed { stream: &'static str, error: String },
     DailyTaskStarted { task_id: usize, taskchain: String },
     CopilotStageSucceeded,
     ProgressFailed(String),
     Exited { code: Option<i32>, stopped: bool },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TaskKind {
-    Daily,
-    Copilot,
-    Update,
-}
-
-#[derive(Debug, Clone)]
-pub struct TaskCommand {
-    pub kind: TaskKind,
-    pub label: String,
-    pub program: String,
-    pub args: Vec<String>,
-    pub envs: Vec<(String, String)>,
-    /// 单任务执行：记录选中的任务索引，用于构造进度集合。
-    pub daily_single_index: Option<usize>,
-    /// 运行结束后需要删除的临时文件（单任务执行生成）。
-    pub cleanup: Option<PathBuf>,
-}
-
-impl TaskCommand {
-    pub fn daily() -> Self {
-        Self::maa(TaskKind::Daily, "每日任务", ["run", "daily", "-v"])
-    }
-
-    /// 单独执行 daily 配置中第 `index` 个任务：运行只含该任务的临时文件，
-    /// 结束后删除 `cleanup` 指向的临时任务文件。
-    pub fn daily_single(index: usize, task_name: &str, file_name: &str, cleanup: PathBuf) -> Self {
-        let mut command = Self::maa(
-            TaskKind::Daily,
-            format!("单任务：{task_name}"),
-            ["run", file_name, "-v"],
-        );
-        command.daily_single_index = Some(index);
-        command.cleanup = Some(cleanup);
-        command
-    }
-
-    pub fn copilot(args: Vec<String>) -> Self {
-        let mut command = Self::maa(TaskKind::Copilot, "自动战斗", std::iter::empty::<&str>());
-        command.args = args;
-        command
-    }
-
-    pub fn copilot_batch(task_path: &str) -> Self {
-        Self::maa(
-            TaskKind::Copilot,
-            "作业集自动战斗",
-            ["run", task_path, "--batch", "-v"],
-        )
-    }
-
-    pub fn resource_update() -> Self {
-        Self::maa(
-            TaskKind::Update,
-            "资源热更新",
-            ["hot-update", "--batch", "-v"],
-        )
-    }
-
-    pub fn core_update() -> Self {
-        Self::maa(
-            TaskKind::Update,
-            "Core 与基础资源更新",
-            ["update", "--batch", "-v"],
-        )
-    }
-
-    fn maa<I, S>(kind: TaskKind, label: impl Into<String>, args: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        Self {
-            kind,
-            label: label.into(),
-            program: "maa".to_string(),
-            args: args.into_iter().map(Into::into).collect(),
-            envs: vec![("MAA_LOG_PREFIX".to_string(), "Always".to_string())],
-            daily_single_index: None,
-            cleanup: None,
-        }
-    }
-
-    pub fn tracks_daily_progress(&self) -> bool {
-        self.kind == TaskKind::Daily
-    }
-
-    pub fn tracks_copilot_progress(&self) -> bool {
-        self.kind == TaskKind::Copilot
-    }
-
-    pub fn display(&self) -> String {
-        std::iter::once(self.program.as_str())
-            .chain(self.args.iter().map(String::as_str))
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileIdentity {
-    device: u64,
-    inode: u64,
-}
-
-impl FileIdentity {
-    fn from_metadata(metadata: &fs::Metadata) -> Self {
-        Self {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        }
-    }
-}
-
-struct CoreLogCursor {
-    path: PathBuf,
-    backup_path: PathBuf,
-    offset: u64,
-    identity: Option<FileIdentity>,
-    pid: u32,
-    partial: String,
-    track_daily: bool,
-    track_copilot: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum CoreProgressEvent {
-    DailyTaskStarted { task_id: usize, taskchain: String },
-    CopilotStageSucceeded,
-}
-
-impl CoreLogCursor {
-    fn prepare(track_daily: bool, track_copilot: bool) -> Result<Self, String> {
-        let dir = maa_log_dir().map_err(|error| format!("无法定位 MaaCore 日志目录: {error}"))?;
-        Self::prepare_in_dir(&dir, track_daily, track_copilot)
-    }
-
-    fn prepare_in_dir(dir: &Path, track_daily: bool, track_copilot: bool) -> Result<Self, String> {
-        let path = dir.join("asst.log");
-        let backup_path = dir.join("asst.bak.log");
-        let (offset, identity) = match fs::metadata(&path) {
-            Ok(metadata) => (metadata.len(), Some(FileIdentity::from_metadata(&metadata))),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (0, None),
-            Err(error) => return Err(format!("读取 MaaCore 日志失败: {error}")),
-        };
-        Ok(Self {
-            path,
-            backup_path,
-            offset,
-            identity,
-            pid: 0,
-            partial: String::new(),
-            track_daily,
-            track_copilot,
-        })
-    }
-
-    fn poll(&mut self) -> std::io::Result<Vec<CoreProgressEvent>> {
-        let metadata = match fs::metadata(&self.path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Vec::new());
-            }
-            Err(error) => return Err(error),
-        };
-        let current_identity = FileIdentity::from_metadata(&metadata);
-        let mut events = Vec::new();
-        if self
-            .identity
-            .is_some_and(|identity| identity != current_identity)
-            || metadata.len() < self.offset
-        {
-            events.extend(self.read_rotated_backup()?);
-            self.offset = 0;
-            self.partial.clear();
-        }
-        self.identity = Some(current_identity);
-        events.extend(self.read_current()?);
-        Ok(events)
-    }
-
-    fn read_rotated_backup(&mut self) -> std::io::Result<Vec<CoreProgressEvent>> {
-        let Some(identity) = self.identity else {
-            return Ok(Vec::new());
-        };
-        let Ok(metadata) = fs::metadata(&self.backup_path) else {
-            return Ok(Vec::new());
-        };
-        if FileIdentity::from_metadata(&metadata) != identity || metadata.len() <= self.offset {
-            return Ok(Vec::new());
-        }
-        let mut lines = Vec::new();
-        self.read_from(self.backup_path.clone(), metadata.len(), &mut lines)?;
-        Ok(lines
-            .into_iter()
-            .filter_map(|line| self.parse_progress_line(&line))
-            .collect())
-    }
-
-    fn read_current(&mut self) -> std::io::Result<Vec<CoreProgressEvent>> {
-        let len = fs::metadata(&self.path)?.len();
-        let mut lines = Vec::new();
-        self.read_from(self.path.clone(), len, &mut lines)?;
-        Ok(lines
-            .into_iter()
-            .filter_map(|line| self.parse_progress_line(&line))
-            .collect())
-    }
-
-    fn read_from(
-        &mut self,
-        path: PathBuf,
-        len: u64,
-        lines: &mut Vec<String>,
-    ) -> std::io::Result<()> {
-        if len <= self.offset {
-            return Ok(());
-        }
-        let mut file = File::open(path)?;
-        file.seek(SeekFrom::Start(self.offset))?;
-        let mut bytes = Vec::with_capacity((len - self.offset) as usize);
-        file.read_to_end(&mut bytes)?;
-        self.offset = len;
-        self.partial.push_str(&String::from_utf8_lossy(&bytes));
-        while let Some(index) = self.partial.find('\n') {
-            let line = self.partial[..index].trim_end_matches('\r').to_string();
-            self.partial.drain(..=index);
-            lines.push(line);
-        }
-        Ok(())
-    }
-
-    fn parse_progress_line(&self, line: &str) -> Option<CoreProgressEvent> {
-        if !line.contains(&format!("[Px{}]", self.pid)) {
-            return None;
-        }
-        let (callback, raw_json) = line
-            .split_once("Assistant::append_callback | ")?
-            .1
-            .split_once(' ')?;
-        let payload: JsonValue = serde_json::from_str(raw_json).ok()?;
-        let taskchain = payload.get("taskchain")?.as_str()?;
-
-        if self.track_daily && callback == "TaskChainStart" {
-            let task_id = payload.get("taskid")?.as_u64()? as usize;
-            return Some(CoreProgressEvent::DailyTaskStarted {
-                task_id,
-                taskchain: taskchain.to_string(),
-            });
-        }
-        if self.track_copilot
-            && callback == "SubTaskStart"
-            && taskchain == "Copilot"
-            && payload
-                .pointer("/details/task")
-                .and_then(JsonValue::as_str)
-                .is_some_and(|task| {
-                    matches!(task, "StageDrops-Stars-3" | "StageDrops-Stars-Adverse")
-                })
-        {
-            return Some(CoreProgressEvent::CopilotStageSucceeded);
-        }
-        None
-    }
-}
-
-pub struct RunningTask {
-    child: Child,
-    pgid: pid_t,
-    event_rx: Receiver<RunnerEvent>,
-    stop_requested: bool,
-    term_at: Option<Instant>,
-    finished: bool,
-    exit_emitted: bool,
-    core_log: Option<CoreLogCursor>,
-}
-
-impl RunningTask {
-    pub fn spawn(command: &TaskCommand) -> Result<Self, String> {
-        let track_daily = command.tracks_daily_progress();
-        let track_copilot = command.tracks_copilot_progress();
-        let core_log = (track_daily || track_copilot)
-            .then(|| CoreLogCursor::prepare(track_daily, track_copilot))
-            .transpose()?;
-        Self::spawn_command_with_env(
-            &command.program,
-            &command.args.iter().map(String::as_str).collect::<Vec<_>>(),
-            &command
-                .envs
-                .iter()
-                .map(|(key, value)| (key.as_str(), value.as_str()))
-                .collect::<Vec<_>>(),
-            core_log,
-        )
-    }
-
-    #[cfg(test)]
-    pub fn spawn_command(program: &str, args: &[&str]) -> Result<Self, String> {
-        Self::spawn_command_with_env(program, args, &[], None)
-    }
-
-    fn spawn_command_with_env(
-        program: &str,
-        args: &[&str],
-        envs: &[(&str, &str)],
-        mut core_log: Option<CoreLogCursor>,
-    ) -> Result<Self, String> {
-        let (tx, rx) = mpsc::channel::<RunnerEvent>();
-
-        let mut cmd = Command::new(program);
-        cmd.args(args)
-            .envs(envs.iter().copied())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        // 独立进程组，停止时组杀避免 MaaCore 等子进程残留。
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::setpgid(0, 0) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-
-        let mut child = match cmd.spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                let message = if error.kind() == std::io::ErrorKind::NotFound {
-                    format!("找不到命令 `{program}`，请确认已安装并在 PATH 中")
-                } else {
-                    format!("启动 `{program}` 失败: {error}")
-                };
-                return Err(message);
-            }
-        };
-
-        let pgid = child.id() as pid_t;
-        if let Some(cursor) = core_log.as_mut() {
-            cursor.pid = child.id();
-        }
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "缺少 stdout pipe".to_string())?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| "缺少 stderr pipe".to_string())?;
-
-        spawn_reader(stdout, false, tx.clone());
-        spawn_reader(stderr, true, tx);
-
-        Ok(Self {
-            child,
-            pgid,
-            event_rx: rx,
-            stop_requested: false,
-            term_at: None,
-            finished: false,
-            exit_emitted: false,
-            core_log,
-        })
-    }
-
-    pub fn poll_events(&mut self) -> Vec<RunnerEvent> {
-        let mut events = Vec::new();
-        while let Ok(event) = self.event_rx.try_recv() {
-            events.push(event);
-        }
-        self.poll_core_log(&mut events);
-
-        if self.stop_requested
-            && !self.finished
-            && let Some(term_at) = self.term_at
-            && term_at.elapsed() >= Duration::from_secs(3)
-        {
-            let _ = unsafe { kill(-self.pgid, SIGKILL) };
-            self.term_at = None;
-        }
-
-        if !self.finished {
-            match self.child.try_wait() {
-                Ok(Some(status)) => {
-                    self.finished = true;
-                    self.poll_core_log(&mut events);
-                    if !self.exit_emitted {
-                        self.exit_emitted = true;
-                        events.push(RunnerEvent::Exited {
-                            code: status.code(),
-                            stopped: self.stop_requested,
-                        });
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    self.finished = true;
-                    events.push(RunnerEvent::Line {
-                        level: LogLevel::Error,
-                        text: format!("等待子进程出错: {error}"),
-                    });
-                    if !self.exit_emitted {
-                        self.exit_emitted = true;
-                        events.push(RunnerEvent::Exited {
-                            code: None,
-                            stopped: self.stop_requested,
-                        });
-                    }
-                }
-            }
-        }
-
-        events
-    }
-
-    fn poll_core_log(&mut self, events: &mut Vec<RunnerEvent>) {
-        let Some(cursor) = self.core_log.as_mut() else {
-            return;
-        };
-        match cursor.poll() {
-            Ok(progress) => events.extend(progress.into_iter().map(|event| match event {
-                CoreProgressEvent::DailyTaskStarted { task_id, taskchain } => {
-                    RunnerEvent::DailyTaskStarted { task_id, taskchain }
-                }
-                CoreProgressEvent::CopilotStageSucceeded => RunnerEvent::CopilotStageSucceeded,
-            })),
-            Err(error) => {
-                events.push(RunnerEvent::ProgressFailed(error.to_string()));
-                self.core_log = None;
-            }
-        }
-    }
-
-    pub fn request_stop(&mut self) {
-        if self.finished || self.stop_requested {
-            return;
-        }
-        self.stop_requested = true;
-        self.term_at = Some(Instant::now());
-        let _ = unsafe { kill(-self.pgid, SIGTERM) };
-    }
-
-    pub fn is_finished(&self) -> bool {
-        self.finished
-    }
-
-    pub fn stop_requested(&self) -> bool {
-        self.stop_requested
-    }
-
-    pub fn force_cleanup(mut self) {
-        if !self.finished {
-            self.request_stop();
-            let deadline = Instant::now() + Duration::from_secs(3);
-            loop {
-                match self.child.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) => {
-                        if Instant::now() >= deadline {
-                            let _ = unsafe { kill(-self.pgid, SIGKILL) };
-                            let _ = self.child.wait();
-                            break;
-                        }
-                        thread::sleep(Duration::from_millis(50));
-                    }
-                    Err(_) => {
-                        let _ = unsafe { kill(-self.pgid, SIGKILL) };
-                        let _ = self.child.wait();
-                        break;
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn spawn_reader<R: std::io::Read + Send + 'static>(
-    reader: R,
-    is_stderr: bool,
-    tx: Sender<RunnerEvent>,
-) {
-    let _ = thread::Builder::new()
-        .name(if is_stderr {
-            "maa-log-stderr".to_string()
-        } else {
-            "maa-log-stdout".to_string()
-        })
-        .spawn(move || {
-            for line in BufReader::new(reader).lines() {
-                match line {
-                    Ok(raw) => {
-                        let (level, text) = classify_log_line(&raw, is_stderr);
-                        if tx.send(RunnerEvent::Line { level, text }).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-}
-
-pub fn classify_log_line(raw: &str, _is_stderr: bool) -> (LogLevel, String) {
-    let text = strip_str(raw);
-    let upper = text.to_ascii_uppercase();
-    let level = if contains_level(&upper, "ERROR") {
-        LogLevel::Error
-    } else if contains_level(&upper, "WARN") {
-        LogLevel::Warn
-    } else if contains_level(&upper, "DEBUG") {
-        LogLevel::Debug
-    } else if contains_level(&upper, "TRACE") {
-        LogLevel::Trace
-    } else if contains_level(&upper, "INFO") {
-        LogLevel::Info
-    } else if upper.contains("SUCCESS") || text.contains("完成") || text.contains("成功") {
-        LogLevel::Success
-    } else {
-        // maa-cli 的常规日志也写入 stderr，不能仅凭输出流判定为警告。
-        LogLevel::Plain
-    };
-    (level, text)
-}
-
-fn contains_level(text: &str, level: &str) -> bool {
-    text.contains(&format!("[{level}]"))
-        || text.contains(&format!(" {level} "))
-        || text.starts_with(&format!("{level}:"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runner::core_progress::{CoreLogCursor, CoreProgressEvent, FileIdentity};
+    use std::fs;
     use std::fs::OpenOptions;
     use std::io::Write;
+    use std::path::PathBuf;
+    use std::thread;
+    use std::time::{Duration, Instant};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir() -> PathBuf {
@@ -598,6 +66,17 @@ mod tests {
         assert_eq!(batch.args, ["run", "/tmp/batch.json", "--batch", "-v"]);
         assert_eq!(batch.kind, TaskKind::Copilot);
         assert!(batch.tracks_copilot_progress());
+
+        let roguelike = TaskCommand::roguelike(
+            "maatui-roguelike-test",
+            std::path::PathBuf::from("/tmp/roguelike.json"),
+        );
+        assert_eq!(
+            roguelike.args,
+            ["run", "maatui-roguelike-test", "--batch", "-v"]
+        );
+        assert_eq!(roguelike.kind, TaskKind::Roguelike);
+        assert_eq!(roguelike.cleanup, Some("/tmp/roguelike.json".into()));
     }
 
     #[test]
@@ -749,6 +228,7 @@ mod tests {
             for event in task.poll_events() {
                 match event {
                     RunnerEvent::Line { level, text } => lines.push((level, text)),
+                    RunnerEvent::LogReaderFailed { .. } => {}
                     RunnerEvent::DailyTaskStarted { .. } => {}
                     RunnerEvent::CopilotStageSucceeded => {}
                     RunnerEvent::ProgressFailed(_) => {}
@@ -772,6 +252,26 @@ mod tests {
         );
         assert_eq!(exited, Some((Some(0), false)));
         assert!(task.is_finished());
+    }
+
+    #[test]
+    fn preserves_lines_with_invalid_utf8() {
+        let mut task =
+            RunningTask::spawn_command("sh", &["-c", "printf '\\377\\n'"]).expect("spawn sh");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut saw_replacement = false;
+        while Instant::now() < deadline {
+            for event in task.poll_events() {
+                if let RunnerEvent::Line { text, .. } = event {
+                    saw_replacement = text.contains('�');
+                }
+            }
+            if saw_replacement {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(saw_replacement);
     }
 
     #[test]

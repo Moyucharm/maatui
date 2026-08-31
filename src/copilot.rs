@@ -13,6 +13,8 @@ pub use detail::CopilotDetail;
 pub use import::{ImportKind, ImportProgress, ImportReport, import_source};
 
 #[cfg(test)]
+use crate::tile_alias::StageAliasIndex;
+#[cfg(test)]
 pub(crate) use batch::write_batch_task_in;
 #[cfg(test)]
 use cache::CACHE_VERSION;
@@ -84,7 +86,7 @@ mod tests {
         for file in [&first_path, &second_path, &batch_path] {
             fs::write(file, "{}").unwrap();
         }
-        let mut cache = CopilotCache::load(path, files).unwrap();
+        let mut cache = CopilotCache::load(path.clone(), files.clone()).unwrap();
         cache
             .append(vec![CopilotEntry {
                 enabled: true,
@@ -114,6 +116,14 @@ mod tests {
         assert_eq!(cache.current_single().unwrap().stage_name, "TO-2");
         assert_eq!(cache.entries().len(), 1);
         assert_eq!(cache.entries()[0].stage_name, "SET-1");
+
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(persisted.get("current_single").is_none());
+        let reloaded = CopilotCache::load(path, files).unwrap();
+        assert!(reloaded.current_single().is_none());
+        assert_eq!(reloaded.entries().len(), 1);
+        assert_eq!(reloaded.entries()[0].stage_name, "SET-1");
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -196,11 +206,14 @@ mod tests {
             (2, vec![true]),
             (3, vec![false, true]),
         ] {
-            let parsed = parse_copilot_content(&json!({
-                "stage_name": "TO-1",
-                "difficulty": difficulty,
-                "doc": {"title": "测试作业"}
-            }))
+            let parsed = parse_copilot_content(
+                &json!({
+                    "stage_name": "TO-1",
+                    "difficulty": difficulty,
+                    "doc": {"title": "测试作业"}
+                }),
+                &StageAliasIndex::default(),
+            )
             .unwrap();
             let entries =
                 parsed.into_entries(CopilotEntrySource::Remote { id: 1 }, CopilotOrigin::Single);
@@ -226,9 +239,15 @@ mod tests {
 
     #[test]
     fn rejects_sss_and_invalid_content() {
-        assert!(parse_copilot_content(&json!({"type": "SSS", "stage_name": "x"})).is_err());
-        assert!(parse_copilot_content(&json!({"difficulty": 1})).is_err());
-        assert!(parse_copilot_content(&json!({"stage_name": "TO-1", "difficulty": 4})).is_err());
+        let aliases = StageAliasIndex::default();
+        assert!(
+            parse_copilot_content(&json!({"type": "SSS", "stage_name": "x"}), &aliases).is_err()
+        );
+        assert!(parse_copilot_content(&json!({"difficulty": 1}), &aliases).is_err());
+        assert!(
+            parse_copilot_content(&json!({"stage_name": "TO-1", "difficulty": 4}), &aliases)
+                .is_err()
+        );
     }
 
     #[test]
@@ -283,14 +302,13 @@ mod tests {
     }
 
     #[test]
-    fn v3_migration_preserves_current_single_and_entries() {
-        let dir = temp_dir();
-        let path = dir.join("copilot-set.json");
-        let files = dir.join("files");
-        fs::write(
-            &path,
-            r#"{
-                "version": 3,
+    fn v3_and_v4_migrations_discard_current_single_but_preserve_entries() {
+        for version in [3, 4] {
+            let dir = temp_dir();
+            let path = dir.join("copilot-set.json");
+            let files = dir.join("files");
+            let legacy = json!({
+                "version": version,
                 "current_single": {
                     "enabled": true,
                     "stage_name": "TO-1",
@@ -306,18 +324,24 @@ mod tests {
                     "source": {"kind": "remote", "id": 2},
                     "origin": {"kind": "set", "id": 50501}
                 }]
-            }"#,
-        )
-        .unwrap();
+            });
+            fs::write(
+                &path,
+                format!("{}\n", serde_json::to_string_pretty(&legacy).unwrap()),
+            )
+            .unwrap();
 
-        let cache = CopilotCache::load(path.clone(), files).unwrap();
-        assert_eq!(cache.current_single().unwrap().stage_name, "TO-1");
-        assert_eq!(cache.entry(0).unwrap().stage_name, "TO-2");
-        assert_eq!(cache.settings(), &CopilotOptions::default());
-        let persisted: JsonValue =
-            serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
-        assert_eq!(persisted["version"], CACHE_VERSION);
-        fs::remove_dir_all(dir).unwrap();
+            let cache = CopilotCache::load(path.clone(), files.clone()).unwrap();
+            assert!(cache.current_single().is_none());
+            assert!(cache.migrated_single_reset());
+            assert_eq!(cache.entry(0).unwrap().stage_name, "TO-2");
+            assert_eq!(cache.settings(), &CopilotOptions::default());
+            let persisted: JsonValue =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(persisted["version"], CACHE_VERSION);
+            assert!(persisted.get("current_single").is_none());
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]

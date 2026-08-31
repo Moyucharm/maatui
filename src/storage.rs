@@ -1,162 +1,74 @@
-//! MaaTUI 自有数据的路径解析与原子写入。
-
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+//! MaaTUI 自有数据的路径解析、缓存维护与原子写入。
 
 use anyhow::{Context, Result, bail};
+use std::fs;
+use std::path::Path;
 
-pub fn maa_config_dir() -> Result<PathBuf> {
-    resolve_maa_config_dir(
-        std::env::var_os("MAA_CONFIG_DIR"),
-        std::env::var_os("XDG_CONFIG_HOME"),
-        std::env::var_os("HOME"),
-    )
+mod atomic;
+mod paths;
+
+pub(crate) use atomic::atomic_write;
+pub(crate) use paths::{
+    maa_config_dir, maa_data_dir, maa_hot_update_dir, maa_log_dir, maatui_cache_dir,
+};
+#[cfg(test)]
+use paths::{resolve_maa_config_dir, resolve_maa_data_dir, resolve_maa_state_dir};
+
+pub(crate) fn clear_maa_avatar_cache() -> Result<usize> {
+    clear_avatar_cache_in(&maa_config_dir()?.join("cache/avatars"))
 }
 
-fn resolve_maa_config_dir(
-    maa_config_dir: Option<std::ffi::OsString>,
-    xdg_config_home: Option<std::ffi::OsString>,
-    home: Option<std::ffi::OsString>,
-) -> Result<PathBuf> {
-    if let Some(dir) = maa_config_dir {
-        return Ok(PathBuf::from(dir));
-    }
-    if let Some(dir) = xdg_config_home {
-        return Ok(PathBuf::from(dir).join("maa"));
-    }
-    let home = home.context("无法确定 HOME，且未设置 MAA_CONFIG_DIR/XDG_CONFIG_HOME")?;
-    Ok(PathBuf::from(home).join(".config/maa"))
-}
-
-pub fn maa_data_dir() -> Result<PathBuf> {
-    resolve_maa_data_dir(
-        std::env::var_os("MAA_DATA_DIR"),
-        std::env::var_os("XDG_DATA_HOME"),
-        std::env::var_os("HOME"),
-    )
-}
-
-pub fn maa_log_dir() -> Result<PathBuf> {
-    Ok(resolve_maa_state_dir(
-        std::env::var_os("MAA_STATE_DIR"),
-        std::env::var_os("XDG_STATE_HOME"),
-        std::env::var_os("HOME"),
-    )?
-    .join("debug"))
-}
-
-fn resolve_maa_state_dir(
-    maa_state_dir: Option<std::ffi::OsString>,
-    xdg_state_home: Option<std::ffi::OsString>,
-    home: Option<std::ffi::OsString>,
-) -> Result<PathBuf> {
-    if let Some(dir) = maa_state_dir {
-        return Ok(PathBuf::from(dir));
-    }
-    if let Some(dir) = xdg_state_home {
-        return Ok(PathBuf::from(dir).join("maa"));
-    }
-    let home = home.context("无法确定 HOME，且未设置 MAA_STATE_DIR/XDG_STATE_HOME")?;
-    Ok(PathBuf::from(home).join(".local/state/maa"))
-}
-
-fn resolve_maa_data_dir(
-    maa_data_dir: Option<std::ffi::OsString>,
-    xdg_data_home: Option<std::ffi::OsString>,
-    home: Option<std::ffi::OsString>,
-) -> Result<PathBuf> {
-    if let Some(dir) = maa_data_dir {
-        return Ok(PathBuf::from(dir));
-    }
-    if let Some(dir) = xdg_data_home {
-        return Ok(PathBuf::from(dir).join("maa"));
-    }
-    let home = home.context("无法确定 HOME，且未设置 MAA_DATA_DIR/XDG_DATA_HOME")?;
-    Ok(PathBuf::from(home).join(".local/share/maa"))
-}
-
-pub fn maa_hot_update_dir() -> Result<PathBuf> {
-    if let Some(dir) = std::env::var_os("MAA_HOT_UPDATE_DIR") {
-        return Ok(PathBuf::from(dir));
-    }
-    Ok(maa_data_dir()?.join("MaaResource"))
-}
-
-pub fn maatui_cache_dir() -> Result<PathBuf> {
-    if let Some(dir) = std::env::var_os("XDG_CACHE_HOME") {
-        return Ok(PathBuf::from(dir).join("maatui"));
-    }
-    let home = std::env::var_os("HOME").context("无法确定 HOME，且未设置 XDG_CACHE_HOME")?;
-    Ok(PathBuf::from(home).join(".cache/maatui"))
-}
-
-pub fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
-    let save_path = match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(path)
-            .with_context(|| format!("解析数据链接失败: {}", path.display()))?,
-        Ok(_) => path.to_path_buf(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => path.to_path_buf(),
+fn clear_avatar_cache_in(dir: &Path) -> Result<usize> {
+    let metadata = match fs::symlink_metadata(dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(error) => {
-            return Err(error).with_context(|| format!("读取数据元信息失败: {}", path.display()));
+            return Err(error).with_context(|| format!("读取干员头像缓存失败: {}", dir.display()));
         }
     };
-    let permissions = fs::metadata(&save_path)
-        .ok()
-        .map(|metadata| metadata.permissions());
-    let (temp_path, mut temp) = create_temp_file(&save_path)?;
-    let write_result = (|| -> Result<()> {
-        if let Some(permissions) = permissions {
-            fs::set_permissions(&temp_path, permissions)?;
-        }
-        temp.write_all(content)?;
-        temp.sync_all()?;
-        drop(temp);
-        fs::rename(&temp_path, &save_path)
-            .with_context(|| format!("替换数据文件失败: {}", save_path.display()))?;
-        Ok(())
-    })();
-    if write_result.is_err() {
-        let _ = fs::remove_file(&temp_path);
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("干员头像缓存路径不是安全目录: {}", dir.display());
     }
-    write_result
-}
 
-fn create_temp_file(path: &Path) -> Result<(PathBuf, File)> {
-    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(error).with_context(|| format!("读取干员头像缓存失败: {}", dir.display()));
+        }
+    };
 
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("数据文件名无效")?;
-    for _ in 0..100 {
-        let sequence = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let temp_path = path.with_file_name(format!(
-            ".{file_name}.maatui.{}.{}.tmp",
-            std::process::id(),
-            sequence
-        ));
-        match OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temp_path)
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("读取干员头像缓存失败: {}", dir.display()))?;
+        if !entry
+            .file_type()
+            .with_context(|| format!("读取缓存文件类型失败: {}", entry.path().display()))?
+            .is_file()
+            || !entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
         {
-            Ok(file) => return Ok((temp_path, file)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("创建临时数据失败: {}", temp_path.display()));
-            }
+            continue;
         }
+        fs::remove_file(entry.path()).with_context(|| {
+            format!(
+                "删除干员头像缓存失败: {}（此前已删除 {removed} 个）",
+                entry.path().display()
+            )
+        })?;
+        removed += 1;
     }
-    bail!("无法创建唯一的临时数据文件")
+    Ok(removed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir() -> PathBuf {
@@ -170,12 +82,58 @@ mod tests {
     }
 
     #[test]
+    fn clears_only_top_level_avatar_png_files() {
+        let root = temp_dir();
+        let avatars = root.join("cache/avatars");
+        let nested = avatars.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(avatars.join("char_a.png"), "avatar").unwrap();
+        fs::write(avatars.join("char_b.PNG"), "avatar").unwrap();
+        fs::write(avatars.join("keep.json"), "metadata").unwrap();
+        fs::write(nested.join("keep.png"), "nested avatar").unwrap();
+        symlink(avatars.join("char_a.png"), avatars.join("linked.png")).unwrap();
+
+        assert_eq!(clear_avatar_cache_in(&avatars).unwrap(), 2);
+        assert!(!avatars.join("char_a.png").exists());
+        assert!(!avatars.join("char_b.PNG").exists());
+        assert!(avatars.join("keep.json").is_file());
+        assert!(nested.join("keep.png").is_file());
+        assert!(fs::symlink_metadata(avatars.join("linked.png")).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_or_empty_avatar_cache_needs_no_cleanup() {
+        let root = temp_dir();
+        let avatars = root.join("cache/avatars");
+        assert_eq!(clear_avatar_cache_in(&avatars).unwrap(), 0);
+        fs::create_dir_all(&avatars).unwrap();
+        assert_eq!(clear_avatar_cache_in(&avatars).unwrap(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_symlinked_avatar_cache_directory() {
+        let root = temp_dir();
+        let outside = temp_dir();
+        fs::write(outside.join("keep.png"), "avatar").unwrap();
+        fs::create_dir_all(root.join("cache")).unwrap();
+        let avatars = root.join("cache/avatars");
+        symlink(&outside, &avatars).unwrap();
+
+        assert!(clear_avatar_cache_in(&avatars).is_err());
+        assert!(outside.join("keep.png").is_file());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
     fn writes_new_file_atomically() {
         let dir = temp_dir();
         let path = dir.join("nested/data.json");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        atomic_write(&path, b"first\n").unwrap();
-        atomic_write(&path, b"second\n").unwrap();
+        atomic_write(&path, &dir, b"first\n").unwrap();
+        atomic_write(&path, &dir, b"second\n").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "second\n");
         fs::remove_dir_all(dir).unwrap();
     }
@@ -244,7 +202,7 @@ mod tests {
         fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
         symlink(&target, &path).unwrap();
 
-        atomic_write(&path, b"new").unwrap();
+        atomic_write(&path, &dir, b"new").unwrap();
 
         assert!(
             fs::symlink_metadata(&path)
@@ -258,5 +216,20 @@ mod tests {
             0o600
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_symlink_to_external_target() {
+        let dir = temp_dir();
+        let outside = temp_dir();
+        let target = outside.join("target.json");
+        let path = dir.join("data.json");
+        fs::write(&target, "old").unwrap();
+        symlink(&target, &path).unwrap();
+
+        assert!(atomic_write(&path, &dir, b"new").is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "old");
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 }

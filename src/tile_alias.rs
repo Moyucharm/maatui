@@ -7,11 +7,24 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde_json::Value;
 
-use crate::storage::{maa_data_dir, maa_hot_update_dir};
+mod index;
+mod paths;
+
+pub(crate) use index::StageAliasIndex;
+use paths::tile_pos_dirs;
+
+fn is_safe_stage_code(code: &str) -> bool {
+    !code.is_empty()
+        && code != "."
+        && code != ".."
+        && !code.contains('/')
+        && !code.contains('\\')
+        && !code.contains('\0')
+}
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct AliasReport {
@@ -43,17 +56,9 @@ impl AliasReport {
 }
 
 /// 将作业 JSON 中的内部地图 ID 解析为 MaaCore 多作业导航使用的关卡码。
+#[allow(dead_code)]
 pub fn resolve_stage_code(stage_name: &str) -> Option<String> {
-    let mut resolved = None;
-    for dir in tile_pos_dirs() {
-        let overview = dir.join("overview.json");
-        if let Ok(raw) = fs::read_to_string(overview)
-            && let Some(code) = resolve_stage_code_from_overview(&raw, stage_name)
-        {
-            resolved = Some(code);
-        }
-    }
-    resolved.or_else(|| is_safe_stage_code(stage_name).then(|| stage_name.to_string()))
+    StageAliasIndex::load().resolve(stage_name)
 }
 
 /// 在常见资源目录生成关卡码 → 真实 Tile-Pos 文件的符号链接。
@@ -72,24 +77,7 @@ pub fn ensure_stage_code_aliases() -> AliasReport {
     report
 }
 
-fn tile_pos_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Ok(data_dir) = maa_data_dir() {
-        dirs.push(data_dir.join("resource/Arknights-Tile-Pos"));
-        dirs.push(data_dir.join("MaaResource/resource/Arknights-Tile-Pos"));
-    }
-    if let Ok(hot_update_dir) = maa_hot_update_dir() {
-        dirs.push(hot_update_dir.join("resource/Arknights-Tile-Pos"));
-    }
-    let mut unique = Vec::new();
-    for dir in dirs.into_iter().filter(|path| path.is_dir()) {
-        if !unique.contains(&dir) {
-            unique.push(dir);
-        }
-    }
-    unique
-}
-
+#[cfg(test)]
 fn resolve_stage_code_from_overview(raw: &str, stage_name: &str) -> Option<String> {
     let value: Value = serde_json::from_str(raw).ok()?;
     let map = value.as_object()?;
@@ -201,18 +189,10 @@ fn filename_matches_stage_code(name: &str, code: &str) -> bool {
         && (remainder == ".json" || remainder.starts_with('-') || remainder.starts_with('_'))
 }
 
-fn is_safe_stage_code(code: &str) -> bool {
-    !code.is_empty()
-        && code != "."
-        && code != ".."
-        && !code.contains('/')
-        && !code.contains('\\')
-        && !code.contains('\0')
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir() -> PathBuf {

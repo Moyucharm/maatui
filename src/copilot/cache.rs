@@ -10,7 +10,7 @@ use super::batch::resolve_entry_path;
 use super::detail::supported_modes_from_path;
 use crate::storage::{atomic_write, maa_config_dir};
 
-pub(super) const CACHE_VERSION: u32 = 4;
+pub(super) const CACHE_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -124,7 +124,8 @@ struct CopilotCacheFile {
     version: u32,
     #[serde(default)]
     settings: CopilotOptions,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // 仅为读取 v3/v4 旧缓存；单作业选择永不写入磁盘。
+    #[serde(default, skip_serializing)]
     current_single: Option<CopilotEntry>,
     #[serde(default)]
     entries: Vec<CopilotEntry>,
@@ -132,6 +133,7 @@ struct CopilotCacheFile {
 
 pub struct CopilotCache {
     path: PathBuf,
+    trusted_root: PathBuf,
     files_dir: PathBuf,
     settings: CopilotOptions,
     current_single: Option<CopilotEntry>,
@@ -142,45 +144,59 @@ pub struct CopilotCache {
 impl CopilotCache {
     pub fn load_default() -> Result<Self> {
         let root = maa_config_dir()?.join("maatui");
-        Self::load(root.join("copilot-set.json"), root.join("copilot"))
+        Self::load_with_trusted_root(root.join("copilot-set.json"), root.join("copilot"), root)
     }
 
+    #[cfg(test)]
     pub fn load(path: PathBuf, files_dir: PathBuf) -> Result<Self> {
-        let (settings, current_single, entries, migrated_single_reset, needs_save) =
-            if path.is_file() {
-                let raw = fs::read_to_string(&path)
-                    .with_context(|| format!("读取作业列表失败: {}", path.display()))?;
-                let file: CopilotCacheFile = serde_json::from_str(&raw)
-                    .with_context(|| format!("解析作业列表失败: {}", path.display()))?;
-                if !(1..=CACHE_VERSION).contains(&file.version) {
-                    bail!("不支持的作业列表版本: {}", file.version);
-                }
-                let (current_single, entries, migrated_single_reset) = if file.version < 3 {
-                    let had_single = file.entries.iter().any(|entry| !entry.origin.is_set());
-                    let entries = file
-                        .entries
-                        .into_iter()
-                        .filter(|entry| entry.origin.is_set())
-                        .collect();
-                    (None, entries, had_single)
-                } else {
-                    (file.current_single, file.entries, false)
-                };
-                (
-                    file.settings,
-                    current_single,
-                    entries,
-                    migrated_single_reset,
-                    file.version < CACHE_VERSION,
-                )
+        let trusted_root = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        Self::load_with_trusted_root(path, files_dir, trusted_root)
+    }
+
+    fn load_with_trusted_root(
+        path: PathBuf,
+        files_dir: PathBuf,
+        trusted_root: PathBuf,
+    ) -> Result<Self> {
+        let (settings, entries, migrated_single_reset, needs_save) = if path.is_file() {
+            let raw = fs::read_to_string(&path)
+                .with_context(|| format!("读取作业列表失败: {}", path.display()))?;
+            let file: CopilotCacheFile = serde_json::from_str(&raw)
+                .with_context(|| format!("解析作业列表失败: {}", path.display()))?;
+            if !(1..=CACHE_VERSION).contains(&file.version) {
+                bail!("不支持的作业列表版本: {}", file.version);
+            }
+            let had_current_single = file.current_single.is_some();
+            let (entries, migrated_legacy_single) = if file.version < 3 {
+                let had_single = file.entries.iter().any(|entry| !entry.origin.is_set());
+                let entries = file
+                    .entries
+                    .into_iter()
+                    .filter(|entry| entry.origin.is_set())
+                    .collect();
+                (entries, had_single)
             } else {
-                (CopilotOptions::default(), None, Vec::new(), false, false)
+                (file.entries, false)
             };
+            (
+                file.settings,
+                entries,
+                migrated_legacy_single || had_current_single,
+                file.version < CACHE_VERSION || had_current_single,
+            )
+        } else {
+            (CopilotOptions::default(), Vec::new(), false, false)
+        };
         let cache = Self {
             path,
+            trusted_root,
             files_dir,
             settings,
-            current_single,
+            current_single: None,
             entries,
             migrated_single_reset,
         };
@@ -233,12 +249,7 @@ impl CopilotCache {
     }
 
     pub fn replace_current_single(&mut self, entry: Option<CopilotEntry>) -> Result<()> {
-        let original = self.current_single.clone();
         self.current_single = entry;
-        if let Err(error) = self.save() {
-            self.current_single = original;
-            return Err(error);
-        }
         Ok(())
     }
 
@@ -253,15 +264,9 @@ impl CopilotCache {
         if !(supports_normal && supports_raid) {
             bail!("当前作业只支持一种难度，无法切换");
         }
-        let original = self.current_single.clone();
         let entry = self.current_single.as_mut().context("请先搜索当前单作业")?;
         entry.is_raid = !entry.is_raid;
-        let is_raid = entry.is_raid;
-        if let Err(error) = self.save() {
-            self.current_single = original;
-            return Err(error);
-        }
-        Ok(is_raid)
+        Ok(entry.is_raid)
     }
 
     pub fn enabled_count(&self) -> usize {
@@ -392,11 +397,11 @@ impl CopilotCache {
         let file = CopilotCacheFile {
             version: CACHE_VERSION,
             settings: self.settings.clone(),
-            current_single: self.current_single.clone(),
+            current_single: None,
             entries: self.entries.clone(),
         };
         let content = format!("{}\n", serde_json::to_string_pretty(&file)?);
-        atomic_write(&self.path, content.as_bytes())
+        atomic_write(&self.path, &self.trusted_root, content.as_bytes())
     }
 
     fn mutate_and_save<T>(

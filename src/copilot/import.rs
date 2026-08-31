@@ -10,7 +10,7 @@ use serde_json::Value as JsonValue;
 use super::cache::{CopilotEntry, CopilotEntrySource, CopilotOrigin};
 use crate::http::{USER_AGENT, agent};
 use crate::storage::atomic_write;
-use crate::tile_alias;
+use crate::tile_alias::StageAliasIndex;
 
 const COPILOT_API: &str = "https://prts.maa.plus/copilot/get/";
 const COPILOT_SET_API: &str = "https://prts.maa.plus/set/get?id=";
@@ -65,6 +65,7 @@ fn import_source_with_agent(
     mut progress: impl FnMut(ImportProgress),
     agent: &ureq::Agent,
 ) -> Result<ImportReport> {
+    let alias_index = StageAliasIndex::load();
     match kind {
         ImportKind::Single => match parse_single_source(input)? {
             ParsedSingleSource::Remote(id) => {
@@ -73,7 +74,7 @@ fn import_source_with_agent(
                     total: 1,
                     label: format!("下载作业 #{id}"),
                 });
-                let parsed = fetch_remote_copilot(agent, id, files_dir)?;
+                let parsed = fetch_remote_copilot(agent, id, files_dir, &alias_index)?;
                 progress(ImportProgress {
                     completed: 1,
                     total: 1,
@@ -89,7 +90,7 @@ fn import_source_with_agent(
                     .with_context(|| format!("定位本地作业失败: {}", path.display()))?;
                 let raw = fs::read_to_string(&canonical)
                     .with_context(|| format!("读取本地作业失败: {}", canonical.display()))?;
-                let parsed = parse_copilot_content(&serde_json::from_str(&raw)?)?;
+                let parsed = parse_copilot_content(&serde_json::from_str(&raw)?, &alias_index)?;
                 progress(ImportProgress {
                     completed: 1,
                     total: 1,
@@ -117,7 +118,7 @@ fn import_source_with_agent(
                     total,
                     label: format!("下载作业 #{copilot_id}"),
                 });
-                match fetch_remote_copilot(agent, copilot_id, files_dir) {
+                match fetch_remote_copilot(agent, copilot_id, files_dir, &alias_index) {
                     Ok(parsed) => entries.extend(parsed.into_entries(
                         CopilotEntrySource::Remote { id: copilot_id },
                         origin.clone(),
@@ -293,7 +294,12 @@ pub(super) fn copilot_agent() -> ureq::Agent {
     agent()
 }
 
-fn fetch_remote_copilot(agent: &ureq::Agent, id: u64, files_dir: &Path) -> Result<ParsedCopilot> {
+fn fetch_remote_copilot(
+    agent: &ureq::Agent,
+    id: u64,
+    files_dir: &Path,
+    alias_index: &StageAliasIndex,
+) -> Result<ParsedCopilot> {
     let url = format!("{COPILOT_API}{id}");
     let response = agent
         .get(&url)
@@ -317,12 +323,16 @@ fn fetch_remote_copilot(agent: &ureq::Agent, id: u64, files_dir: &Path) -> Resul
         JsonValue::String(raw) => serde_json::from_str(&raw).context("解析嵌套作业 JSON 失败")?,
         value => value,
     };
-    let parsed = parse_copilot_content(&content)?;
+    let parsed = parse_copilot_content(&content, alias_index)?;
     fs::create_dir_all(files_dir)
         .with_context(|| format!("创建作业缓存目录失败: {}", files_dir.display()))?;
     let path = files_dir.join(format!("{id}.json"));
     let raw = format!("{}\n", serde_json::to_string_pretty(&parsed.content)?);
-    atomic_write(&path, raw.as_bytes())?;
+    let trusted_root = files_dir
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(files_dir);
+    atomic_write(&path, trusted_root, raw.as_bytes())?;
     Ok(parsed)
 }
 
@@ -350,7 +360,10 @@ fn fetch_copilot_set(agent: &ureq::Agent, id: u64) -> Result<SetData> {
     envelope.data.context("作业集响应缺少 data")
 }
 
-pub(super) fn parse_copilot_content(content: &JsonValue) -> Result<ParsedCopilot> {
+pub(super) fn parse_copilot_content(
+    content: &JsonValue,
+    alias_index: &StageAliasIndex,
+) -> Result<ParsedCopilot> {
     let object = content.as_object().context("作业内容不是 JSON 对象")?;
     if object
         .get("type")
@@ -365,7 +378,8 @@ pub(super) fn parse_copilot_content(content: &JsonValue) -> Result<ParsedCopilot
         .map(str::trim)
         .filter(|stage| !stage.is_empty())
         .context("作业缺少 stage_name")?;
-    let stage_name = tile_alias::resolve_stage_code(raw_stage_name)
+    let stage_name = alias_index
+        .resolve(raw_stage_name)
         .unwrap_or_else(|| raw_stage_name.to_string());
     let difficulty = object
         .get("difficulty")

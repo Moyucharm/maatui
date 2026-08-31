@@ -1,14 +1,18 @@
 //! 应用状态模型与对话框数据。
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
 
 use crate::config::{DailyConfig, FieldValue, TaskSummary};
+use crate::config_save::ConfigSaveWorker;
 use crate::copilot::{CopilotCache, CopilotOptions, ImportKind, ImportProgress, ImportReport};
 use crate::copilot_run::CopilotBatchState;
-use crate::runner::{LogLevel, RunningTask, TaskCommand};
+use crate::notification::NotificationWorker;
+use crate::roguelike::{RoguelikeConfig, RoguelikeField, RoguelikeOptions};
+use crate::runner::{LogLevel, RunningTask, TaskCommand, TaskKind};
 use crate::stage::{StageCatalog, StageRefreshEvent};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,17 +33,25 @@ pub(super) struct DailyRunState {
 pub enum MainMenuItem {
     Daily,
     Copilot,
+    Roguelike,
     Update,
     Quit,
 }
 
 impl MainMenuItem {
-    pub const ALL: [Self; 4] = [Self::Daily, Self::Copilot, Self::Update, Self::Quit];
+    pub const ALL: [Self; 5] = [
+        Self::Daily,
+        Self::Copilot,
+        Self::Roguelike,
+        Self::Update,
+        Self::Quit,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Daily => "每日任务",
             Self::Copilot => "自动战斗",
+            Self::Roguelike => "自动肉鸽",
             Self::Update => "更新管理",
             Self::Quit => "退出",
         }
@@ -49,6 +61,7 @@ impl MainMenuItem {
         match self {
             Self::Daily => "运行与配置 daily 任务",
             Self::Copilot => "单作业 / 作业集（批量）",
+            Self::Roguelike => "控制面板 / 高级设置",
             Self::Update => "手动更新资源或 Core",
             Self::Quit => "安全退出 MaaTUI",
         }
@@ -65,6 +78,7 @@ pub enum Screen {
     VariantList,
     VariantEdit,
     Copilot,
+    Roguelike,
     Update,
 }
 
@@ -104,6 +118,7 @@ pub struct LogLine {
 pub enum LogScope {
     Daily,
     Copilot,
+    Roguelike,
     Update,
 }
 
@@ -128,6 +143,7 @@ impl Default for LogBuffer {
 pub struct MenuLogs {
     pub daily: LogBuffer,
     pub copilot: LogBuffer,
+    pub roguelike: LogBuffer,
     pub update: LogBuffer,
 }
 
@@ -136,6 +152,7 @@ impl MenuLogs {
         match scope {
             LogScope::Daily => &self.daily,
             LogScope::Copilot => &self.copilot,
+            LogScope::Roguelike => &self.roguelike,
             LogScope::Update => &self.update,
         }
     }
@@ -144,6 +161,7 @@ impl MenuLogs {
         match scope {
             LogScope::Daily => &mut self.daily,
             LogScope::Copilot => &mut self.copilot,
+            LogScope::Roguelike => &mut self.roguelike,
             LogScope::Update => &mut self.update,
         }
     }
@@ -268,6 +286,7 @@ pub enum InputTarget {
     },
     CopilotNumber(CopilotNumberField),
     CopilotText(CopilotTextField),
+    RoguelikeField(RoguelikeField),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -344,6 +363,7 @@ pub enum ConfirmTarget {
     DeleteVariant { task: usize, variant: usize },
     DeleteCopilot(usize),
     ClearCopilotEntries,
+    ClearAvatarCache,
     RunCommand(TaskCommand),
 }
 
@@ -400,6 +420,9 @@ pub struct App {
     pub copilot_idx: usize,
     pub copilot_settings_idx: usize,
     pub copilot_section_idx: usize,
+    pub roguelike_idx: usize,
+    pub roguelike_advanced_idx: usize,
+    pub roguelike_section_idx: usize,
     pub update_idx: usize,
     pub phase: TaskPhase,
     pub menu_logs: MenuLogs,
@@ -411,13 +434,22 @@ pub struct App {
     pub last_failed: bool,
     pub config: Option<DailyConfig>,
     pub config_error: Option<String>,
+    pub(super) config_save_worker: Option<ConfigSaveWorker>,
+    pub(super) config_revision: u64,
+    pub(super) config_dirty: bool,
+    pub(super) config_enqueued_revision: Option<u64>,
+    pub(super) config_failed_revision: Option<u64>,
     pub copilot: CopilotOptions,
     pub copilot_cache: Option<CopilotCache>,
     pub copilot_error: Option<String>,
+    pub roguelike: RoguelikeOptions,
+    pub roguelike_config: Option<RoguelikeConfig>,
+    pub roguelike_error: Option<String>,
     pub current_single_supported_modes: Option<(bool, bool)>,
     pub copilot_importing: bool,
     pub copilot_import_progress: Option<ImportProgress>,
     pub stage_catalog: StageCatalog,
+    pub(super) stage_options_cache: RefCell<Option<(String, Vec<SelectOption>)>>,
     pub input: Option<InputDialog>,
     pub select: Option<SelectDialog>,
     pub confirm: Option<ConfirmDialog>,
@@ -426,6 +458,9 @@ pub struct App {
     pub shortcut_help_scroll: u16,
     pub run_progress: Option<RunProgress>,
     pub(super) task: Option<RunningTask>,
+    pub(super) active_task_kind: Option<TaskKind>,
+    pub(super) task_abort_error: Option<String>,
+    pub(super) notification_worker: Option<NotificationWorker>,
     pub(super) daily_run: Option<DailyRunState>,
     /// 单任务执行生成的临时任务文件，运行结束后删除。
     pub(super) temp_task_file: Option<PathBuf>,

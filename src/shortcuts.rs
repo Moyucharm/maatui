@@ -3,6 +3,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::app::{CopilotSection, EditorSection, Screen, TaskPhase};
+use crate::roguelike::RoguelikeSection;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShortcutContext {
@@ -18,6 +19,8 @@ pub enum ShortcutContext {
     CopilotSingles,
     CopilotSets,
     CopilotSettings,
+    RoguelikeControl,
+    RoguelikeAdvanced,
     Update,
 }
 
@@ -27,6 +30,7 @@ impl ShortcutContext {
         screen: Screen,
         editor_section: EditorSection,
         copilot_section: CopilotSection,
+        roguelike_section: RoguelikeSection,
     ) -> Self {
         if phase != TaskPhase::Idle {
             return Self::Running;
@@ -44,6 +48,10 @@ impl ShortcutContext {
                 CopilotSection::Singles => Self::CopilotSingles,
                 CopilotSection::Sets => Self::CopilotSets,
                 CopilotSection::Settings => Self::CopilotSettings,
+            },
+            Screen::Roguelike => match roguelike_section {
+                RoguelikeSection::Control => Self::RoguelikeControl,
+                RoguelikeSection::Advanced => Self::RoguelikeAdvanced,
             },
             Screen::Update => Self::Update,
         }
@@ -71,12 +79,15 @@ pub enum Action {
     CreateVariant,
     PreviousCopilotTab,
     NextCopilotTab,
+    PreviousRoguelikeTab,
+    NextRoguelikeTab,
     SearchSingle,
     ToggleDifficulty,
     ShowDetail,
     RunSingle,
     RunSelected,
     RunBatch,
+    RunRoguelike,
     ToggleAll,
     Clear,
     Stop,
@@ -115,12 +126,15 @@ impl Action {
             Self::CreateVariant => key.code == KeyCode::Char('v'),
             Self::PreviousCopilotTab => key.code == KeyCode::Left,
             Self::NextCopilotTab => matches!(key.code, KeyCode::Tab | KeyCode::Right),
+            Self::PreviousRoguelikeTab => key.code == KeyCode::Left,
+            Self::NextRoguelikeTab => matches!(key.code, KeyCode::Tab | KeyCode::Right),
             Self::SearchSingle => matches!(key.code, KeyCode::Char('a') | KeyCode::Char('e')),
             Self::ToggleDifficulty => key.code == KeyCode::Char(' '),
             Self::ShowDetail => key.code == KeyCode::Char('i'),
             Self::RunSingle => key.code == KeyCode::Enter,
             Self::RunSelected => matches!(key.code, KeyCode::Enter | KeyCode::Char('e')),
             Self::RunBatch => key.code == KeyCode::Char('r'),
+            Self::RunRoguelike => key.code == KeyCode::Char('r'),
             Self::ToggleAll => key.code == KeyCode::Char('t'),
             Self::Clear => key.code == KeyCode::Char('c'),
             Self::Stop => matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('s')),
@@ -484,6 +498,73 @@ const COPILOT_SETTINGS: &[ActionSpec] = &[
     hidden(Action::PreviousCopilotTab),
     shown(Action::Back, "导航", "Esc/q", "返回", "返回主菜单", 5),
 ];
+const ROGUELIKE_CONTROL: &[ActionSpec] = &[
+    shown(
+        Action::Previous,
+        "导航",
+        "↑↓/jk",
+        "选择",
+        "选择运行或控制字段",
+        0,
+    ),
+    hidden(Action::Next),
+    shown(
+        Action::Edit,
+        "编辑",
+        "Enter/e",
+        "编辑",
+        "编辑当前自动肉鸽设置或运行",
+        1,
+    ),
+    shown(
+        Action::RunRoguelike,
+        "运行",
+        "r",
+        "运行",
+        "直接运行自动肉鸽",
+        2,
+    ),
+    shown(
+        Action::NextRoguelikeTab,
+        "导航",
+        "Tab/←→",
+        "切页",
+        "切换自动肉鸽页签",
+        3,
+    ),
+    hidden(Action::PreviousRoguelikeTab),
+    shown(Action::Back, "导航", "Esc/q", "返回", "返回主菜单", 5),
+];
+const ROGUELIKE_ADVANCED: &[ActionSpec] = &[
+    shown(Action::Previous, "导航", "↑↓/jk", "选择", "选择高级设置", 0),
+    hidden(Action::Next),
+    shown(
+        Action::Edit,
+        "编辑",
+        "Enter/e",
+        "编辑",
+        "编辑当前高级设置",
+        1,
+    ),
+    shown(
+        Action::RunRoguelike,
+        "运行",
+        "r",
+        "运行",
+        "直接运行自动肉鸽",
+        2,
+    ),
+    shown(
+        Action::NextRoguelikeTab,
+        "导航",
+        "Tab/←→",
+        "切页",
+        "切换自动肉鸽页签",
+        3,
+    ),
+    hidden(Action::PreviousRoguelikeTab),
+    shown(Action::Back, "导航", "Esc/q", "返回", "返回主菜单", 5),
+];
 const UPDATE: &[ActionSpec] = &[
     shown(Action::Previous, "导航", "↑↓/jk", "选择", "选择更新类型", 0),
     hidden(Action::Next),
@@ -512,6 +593,8 @@ fn specs(context: ShortcutContext) -> &'static [ActionSpec] {
         ShortcutContext::CopilotSingles => COPILOT_SINGLES,
         ShortcutContext::CopilotSets => COPILOT_SETS,
         ShortcutContext::CopilotSettings => COPILOT_SETTINGS,
+        ShortcutContext::RoguelikeControl => ROGUELIKE_CONTROL,
+        ShortcutContext::RoguelikeAdvanced => ROGUELIKE_ADVANCED,
         ShortcutContext::Update => UPDATE,
     }
 }
@@ -605,6 +688,8 @@ mod tests {
             ShortcutContext::CopilotSingles,
             ShortcutContext::CopilotSets,
             ShortcutContext::CopilotSettings,
+            ShortcutContext::RoguelikeControl,
+            ShortcutContext::RoguelikeAdvanced,
             ShortcutContext::Update,
         ] {
             let shown = specs(context).iter().filter_map(|spec| {

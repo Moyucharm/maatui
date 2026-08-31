@@ -2,9 +2,12 @@
 
 mod app;
 mod config;
+mod config_save;
 mod copilot;
 mod copilot_run;
 mod http;
+mod notification;
+mod roguelike;
 mod runner;
 mod shortcuts;
 mod stage;

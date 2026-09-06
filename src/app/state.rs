@@ -462,6 +462,8 @@ pub struct App {
     pub(super) task_abort_error: Option<String>,
     pub(super) notification_worker: Option<NotificationWorker>,
     pub(super) daily_run: Option<DailyRunState>,
+    /// 本次 daily 全量运行中完全禁用的任务链名，用于过滤 maa-cli 转发的空跑回调日志。
+    pub(super) disabled_task_chains: Vec<String>,
     /// 单任务执行生成的临时任务文件，运行结束后删除。
     pub(super) temp_task_file: Option<PathBuf>,
     pub(super) pending_resource_check: bool,

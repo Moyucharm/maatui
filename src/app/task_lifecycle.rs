@@ -1,6 +1,7 @@
 //! Runner 任务生命周期、后台事件和退出处理。
 
 use super::*;
+use crate::config::TaskSummary;
 
 pub(crate) fn log_scope_for_command(command: &TaskCommand) -> LogScope {
     match command.kind {
@@ -14,6 +15,23 @@ pub(crate) fn log_scope_for_command(command: &TaskCommand) -> LogScope {
 pub(super) fn is_resource_update_command(command: &TaskCommand) -> bool {
     command.args.first().is_some_and(|arg| arg == "hot-update")
         || command.label.contains("资源热更新")
+}
+
+/// 收集「完全禁用」（没有任何启用实例）的任务链名。
+/// maa-cli 会把禁用任务的空跑回调转发为 "<chain> Start"/"<chain> Completed" 日志行，
+/// 需要过滤这类噪音；同类型任务只要有任一启用则不过滤，避免误伤真实运行日志。
+pub(crate) fn fully_disabled_chains(tasks: &[TaskSummary]) -> Vec<String> {
+    let mut chains = Vec::new();
+    for task in tasks.iter().filter(|task| !task.enabled) {
+        let already = chains.contains(&task.task_type)
+            || tasks
+                .iter()
+                .any(|other| other.enabled && other.task_type == task.task_type);
+        if !already {
+            chains.push(task.task_type.clone());
+        }
+    }
+    chains
 }
 
 impl App {
@@ -34,6 +52,7 @@ impl App {
         self.task_abort_error = None;
         self.saw_outdated_resource_error = false;
         self.saw_ocr_to_t0_error = false;
+        self.disabled_task_chains.clear();
         if command.tracks_daily_progress() {
             let (tasks, total) = match command.daily_single_index {
                 Some(index) => {
@@ -53,6 +72,7 @@ impl App {
                         .map(DailyConfig::task_summaries)
                         .unwrap_or_default();
                     let total = tasks.iter().filter(|task| task.enabled).count();
+                    self.disabled_task_chains = fully_disabled_chains(&tasks);
                     (tasks, total)
                 }
             };
@@ -93,6 +113,7 @@ impl App {
                 self.last_failed = true;
                 self.run_progress = None;
                 self.daily_run = None;
+                self.disabled_task_chains.clear();
                 self.send_task_notification(
                     command.kind,
                     &command.label,
@@ -184,7 +205,11 @@ impl App {
             .map_or_else(Vec::new, RunningTask::poll_events);
         for event in events {
             match event {
-                RunnerEvent::Line { level, text } => self.push_log(level, text),
+                RunnerEvent::Line { level, text } => {
+                    if !self.is_disabled_chain_log_noise(&text) {
+                        self.push_log(level, text);
+                    }
+                }
                 RunnerEvent::LogReaderFailed { stream, error } => {
                     let message = format!("读取 MaaCore {stream} 日志失败: {error}");
                     self.push_log(LogLevel::Error, message.clone());
@@ -247,6 +272,15 @@ impl App {
                 }
             }
         }
+    }
+
+    /// maa-cli 将禁用任务链的空跑回调转发为 "<chain> Start"/"<chain> Completed" 日志行，
+    /// 判断给定日志行是否属于这类噪音。按尾部匹配，不依赖时间戳前缀的具体格式。
+    pub(super) fn is_disabled_chain_log_noise(&self, text: &str) -> bool {
+        self.disabled_task_chains.iter().any(|chain| {
+            text.ends_with(&format!("{chain} Start"))
+                || text.ends_with(&format!("{chain} Completed"))
+        })
     }
 
     pub(crate) fn on_daily_task_started(&mut self, task_id: usize, taskchain: &str) {
@@ -460,6 +494,8 @@ impl App {
         self.active_label.clear();
         self.run_progress = None;
         self.daily_run = None;
+        // 注意：disabled_task_chains 刻意不在退出时清空——进程退出后 stdout
+        // 管道中残留的日志行仍会经 Line 事件到达，需继续过滤，直到下次启动任务时重置。
         self.saw_outdated_resource_error = false;
         self.saw_ocr_to_t0_error = false;
         let buffer = self.log_buffer_mut(self.active_log_scope);

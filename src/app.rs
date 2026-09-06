@@ -65,6 +65,8 @@ pub(crate) use schema::{task_fields, variant_fields};
 pub use state::*;
 use state::{CopilotImportEvent, DailyRunState, SelectBehavior, option_label};
 #[cfg(test)]
+pub(crate) use task_lifecycle::fully_disabled_chains;
+#[cfg(test)]
 pub(crate) use task_lifecycle::log_scope_for_command;
 
 impl App {
@@ -160,6 +162,7 @@ impl App {
             task_abort_error: None,
             notification_worker: NotificationWorker::new().ok(),
             daily_run: None,
+            disabled_task_chains: Vec::new(),
             pending_resource_check: false,
             resource_version_before: None,
             saw_outdated_resource_error: false,

@@ -469,6 +469,143 @@ fn daily_progress_distinguishes_enabled_tasks_with_same_type() {
 }
 
 #[test]
+fn fully_disabled_chains_marks_only_fully_disabled_types() {
+    let tasks = |specs: &[(bool, &str)]| -> Vec<TaskSummary> {
+        specs
+            .iter()
+            .map(|(enabled, task_type)| TaskSummary {
+                name: task_type.to_string(),
+                task_type: task_type.to_string(),
+                enabled: *enabled,
+            })
+            .collect()
+    };
+
+    // 同类型任务只要有一个启用，其链名就不进入过滤集合。
+    assert_eq!(
+        fully_disabled_chains(&tasks(&[
+            (false, "StartUp"),
+            (false, "Recruit"),
+            (true, "Fight"),
+            (false, "Infrast"),
+            (true, "Infrast"),
+        ])),
+        vec!["StartUp".to_string(), "Recruit".to_string()]
+    );
+    assert_eq!(
+        fully_disabled_chains(&tasks(&[(false, "Fight"), (false, "Fight")])),
+        vec!["Fight".to_string()]
+    );
+    assert!(fully_disabled_chains(&tasks(&[(true, "Award")])).is_empty());
+    assert!(fully_disabled_chains(&[]).is_empty());
+}
+
+#[test]
+fn disabled_chain_log_noise_matches_only_taskchain_tail() {
+    let mut app = App::new();
+    app.disabled_task_chains = vec!["StartUp".to_string(), "Recruit".to_string()];
+
+    // maa-cli 在 MAA_LOG_PREFIX=Always 下转发任务链回调的日志行格式。
+    assert!(app.is_disabled_chain_log_noise("[2026-09-06 22:00:00 INFO] StartUp Start"));
+    assert!(app.is_disabled_chain_log_noise("[2026-09-06 22:00:00 INFO] StartUp Completed"));
+    assert!(app.is_disabled_chain_log_noise("[2026-09-06 22:00:00 INFO] Recruit Completed"));
+
+    // 启用任务链与其他常规日志行不得被误伤。
+    assert!(!app.is_disabled_chain_log_noise("[2026-09-06 22:00:00 INFO] Infrast Start"));
+    assert!(!app.is_disabled_chain_log_noise("AllTasksCompleted"));
+    assert!(!app.is_disabled_chain_log_noise("Mission started"));
+    assert!(!app.is_disabled_chain_log_noise("StartCombat CF-8"));
+    assert!(!app.is_disabled_chain_log_noise("StartUp"));
+
+    // 没有禁用任务时不过滤任何行。
+    app.disabled_task_chains.clear();
+    assert!(!app.is_disabled_chain_log_noise("[2026-09-06 22:00:00 INFO] StartUp Start"));
+}
+
+#[test]
+fn start_command_collects_disabled_chains_for_full_daily_run_only() {
+    let (dir, config) = test_config_with_disabled_tasks();
+    let mut app = App::new();
+    app.config = Some(config);
+
+    let full_run = test_running_command(TaskKind::Daily, "每日任务");
+    assert!(app.start_command(full_run));
+    assert_eq!(
+        app.disabled_task_chains,
+        vec!["StartUp".to_string(), "Recruit".to_string()]
+    );
+    assert_eq!(app.daily_run.as_ref().map(|run| run.total), Some(2));
+    app.cleanup();
+
+    // 单任务运行即使原配置禁用也强制执行，不应过滤其日志。
+    let mut single_run = test_running_command(TaskKind::Daily, "单任务");
+    single_run.daily_single_index = Some(0);
+    assert!(app.start_command(single_run));
+    assert!(app.disabled_task_chains.is_empty());
+    app.cleanup();
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn daily_tick_filters_disabled_chain_log_lines() {
+    let mut app = App::new();
+    let task = RunningTask::spawn_command(
+        "/bin/sh",
+        &[
+            "-c",
+            "echo '[x INFO] StartUp Start'; echo '[x INFO] Award Start'",
+        ],
+    )
+    .unwrap();
+    app.task = Some(task);
+    app.phase = TaskPhase::Running;
+    app.active_log_scope = LogScope::Daily;
+    app.disabled_task_chains = vec!["StartUp".to_string()];
+
+    // 等待 stdout 日志线程输出，再驱动事件循环。
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    for _ in 0..5 {
+        app.tick();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let lines = &app.log_buffer(LogScope::Daily).lines;
+    assert!(
+        lines.iter().any(|line| line.text.contains("Award Start")),
+        "启用任务链日志应保留: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .all(|line| !line.text.ends_with("StartUp Start")),
+        "禁用任务链噪音日志应被过滤: {lines:?}"
+    );
+    app.cleanup();
+}
+
+fn test_config_with_disabled_tasks() -> (PathBuf, DailyConfig) {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("maatui-app-disabled-{unique}"));
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("daily.json");
+    fs::write(
+        &path,
+        r#"{"tasks":[
+            {"type":"StartUp","params":{"enable":false}},
+            {"type":"Recruit","params":{"enable":false}},
+            {"type":"Infrast"},
+            {"type":"Award"}
+        ]}"#,
+    )
+    .unwrap();
+    let config = DailyConfig::load(&path).unwrap();
+    (dir, config)
+}
+
+#[test]
 fn complete_spinner_contains_full_cycle() {
     let app = App::new();
     let frame = app.spinner();

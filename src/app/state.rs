@@ -8,7 +8,10 @@ use std::time::Instant;
 
 use crate::config::{DailyConfig, FieldValue, TaskSummary};
 use crate::config_save::ConfigSaveWorker;
-use crate::copilot::{CopilotCache, CopilotOptions, ImportKind, ImportProgress, ImportReport};
+use crate::copilot::{
+    CopilotCache, CopilotOperatorDetail, CopilotOperatorGroup, CopilotOptions,
+    CopilotSkillActionDetail, ImportKind, ImportProgress, ImportReport,
+};
 use crate::copilot_run::CopilotBatchState;
 use crate::notification::NotificationWorker;
 use crate::roguelike::{RoguelikeConfig, RoguelikeField, RoguelikeOptions};
@@ -404,7 +407,11 @@ pub(super) enum CopilotImportEvent {
 #[derive(Debug, Clone)]
 pub struct CopilotDetailDialog {
     pub title: String,
-    pub lines: Vec<String>,
+    pub overview: Vec<(String, String)>,
+    pub operators: Vec<CopilotOperatorDetail>,
+    pub skill_actions: Vec<CopilotSkillActionDetail>,
+    pub groups: Vec<CopilotOperatorGroup>,
+    pub notes: Vec<String>,
     pub scroll: u16,
 }
 

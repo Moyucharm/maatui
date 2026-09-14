@@ -17,7 +17,7 @@ pub(super) fn draw_daily(frame: &mut Frame, app: &App, area: Rect) {
     let items = rows
         .iter()
         .enumerate()
-        .map(|(index, (label, value))| field_item(index == app.daily_idx, label, value))
+        .map(|(index, (label, value))| field_item(index == app.daily_idx, label, value, area.width))
         .collect();
     render_list(frame, area, " 每日任务 ", items, app.daily_idx);
 }
@@ -45,11 +45,23 @@ pub(super) fn draw_config(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 Style::default().fg(Color::White)
             };
+            let inner_width = area.width.saturating_sub(2) as usize;
+            let name_width = if area.width < 52 { 12 } else { 18 };
+            let task_width = inner_width.saturating_sub(2 + 5 + name_width);
             ListItem::new(Line::from(vec![
                 Span::styled(if selected { "▶ " } else { "  " }, style),
                 Span::styled(format!("{enabled:<5}"), Style::default().fg(enabled_color)),
-                Span::styled(pad_display_width(&summary.name, 18), style),
-                Span::styled(summary.task_type, Style::default().fg(MUTED)),
+                Span::styled(
+                    pad_display_width(
+                        &truncate_display_width(&summary.name, name_width),
+                        name_width,
+                    ),
+                    style,
+                ),
+                Span::styled(
+                    truncate_display_width(&summary.task_type, task_width),
+                    Style::default().fg(MUTED),
+                ),
             ]))
         })
         .collect();
@@ -129,7 +141,12 @@ pub(super) fn draw_task_edit(frame: &mut Frame, app: &App, area: Rect) {
             let value = app
                 .task_field_value(field)
                 .unwrap_or_else(|| field.default.clone());
-            field_item(selected, field.label, &app.field_display(field, &value))
+            field_item(
+                selected,
+                field.label,
+                &app.field_display(field, &value),
+                chunks[1].width,
+            )
         })
         .collect();
     render_list(frame, chunks[1], " 字段 ", items, app.field_idx);
@@ -177,7 +194,12 @@ pub(super) fn draw_variant_edit(frame: &mut Frame, app: &App, area: Rect) {
             let value = app
                 .variant_field_value(field)
                 .unwrap_or_else(|| field.default.clone());
-            field_item(selected, field.label, &app.field_display(field, &value))
+            field_item(
+                selected,
+                field.label,
+                &app.field_display(field, &value),
+                area.width,
+            )
         })
         .collect();
     render_list(frame, area, " 编辑变体 ", items, app.field_idx);

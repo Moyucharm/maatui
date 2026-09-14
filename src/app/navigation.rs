@@ -689,10 +689,21 @@ impl App {
             .context("作业缓存未加载")
             .and_then(CopilotCache::current_single_detail);
         match result {
-            Ok(CopilotDetail { title, lines }) => {
+            Ok(CopilotDetail {
+                title,
+                overview,
+                operators,
+                skill_actions,
+                groups,
+                notes,
+            }) => {
                 self.copilot_detail = Some(CopilotDetailDialog {
                     title: format!("单作业详情 · {title}"),
-                    lines,
+                    overview,
+                    operators,
+                    skill_actions,
+                    groups,
+                    notes,
                     scroll: 0,
                 });
             }
@@ -710,11 +721,22 @@ impl App {
             .context("作业列表未加载")
             .and_then(|cache| cache.detail(index));
         match result {
-            Ok(CopilotDetail { title, lines }) => {
+            Ok(CopilotDetail {
+                title,
+                overview,
+                operators,
+                skill_actions,
+                groups,
+                notes,
+            }) => {
                 debug_assert_eq!(self.copilot_section(), CopilotSection::Sets);
                 self.copilot_detail = Some(CopilotDetailDialog {
                     title: format!("作业集条目详情 · {title}"),
-                    lines,
+                    overview,
+                    operators,
+                    skill_actions,
+                    groups,
+                    notes,
                     scroll: 0,
                 });
             }

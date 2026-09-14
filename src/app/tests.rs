@@ -1279,13 +1279,22 @@ fn copilot_detail_reads_operator_requirements_and_notes() {
                     "name": "逻各斯",
                     "skill": 3,
                     "skill_usage": 1,
-                    "requirements": {"elite": 2, "skill_level": 10, "module": 4}
+                    "requirements": {"elite": 2, "skill_level": 10, "module": 4, "potentiality": 5}
                 }],
                 "groups": [{
                     "name": "替补",
-                    "opers": [{"name": "阿米娅", "skill": 2, "requirements": {"module": 1}}]
+                    "opers": [{
+                        "name": "阿米娅",
+                        "skill": 2,
+                        "requirements": {"module": 1, "potential": 2}
+                    }]
                 }],
-                "actions": [{"type": "SkillUsage", "name": "逻各斯", "skill_times": 2}]
+                "actions": [{
+                    "type": "技能用法",
+                    "name": "逻各斯",
+                    "cost_changes": 3,
+                    "post_delay": 500
+                }]
             }"#,
     )
     .unwrap();
@@ -1297,12 +1306,26 @@ fn copilot_detail_reads_operator_requirements_and_notes() {
 
     let detail = app.copilot_detail.as_ref().unwrap();
     assert!(detail.title.starts_with("单作业详情"));
-    let text = detail.lines.join("\n");
-    assert!(text.contains("关卡名：TO-1"));
-    assert!(text.contains("逻各斯 · 技能 3"));
-    assert!(text.contains("模组 4"));
-    assert!(text.contains("替补：阿米娅（技能 2"));
-    assert!(text.contains("第一行"));
+    assert!(
+        detail
+            .overview
+            .iter()
+            .any(|(label, value)| label == "关卡名" && value == "TO-1")
+    );
+    assert_eq!(detail.operators[0].name, "逻各斯");
+    assert_eq!(detail.operators[0].skill, "3");
+    assert_eq!(detail.operators[0].elite, "2");
+    assert_eq!(detail.operators[0].skill_level, "10");
+    assert_eq!(detail.operators[0].module, "4");
+    assert_eq!(detail.operators[0].potential, "5");
+    assert_eq!(detail.groups[0].name, "替补");
+    assert_eq!(detail.groups[0].operators[0].name, "阿米娅");
+    assert_eq!(detail.groups[0].operators[0].potential, "2");
+    assert_eq!(detail.skill_actions[0].times, "1");
+    assert!(detail.skill_actions[0].trigger.contains("费用变化 3"));
+    assert!(detail.skill_actions[0].trigger.contains("后延迟(ms) 500"));
+    assert_eq!(detail.notes[0], "第一行");
+    assert_eq!(detail.notes[1], "第二行");
     app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
     assert_eq!(app.copilot_detail.as_ref().unwrap().scroll, 10);
     app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));

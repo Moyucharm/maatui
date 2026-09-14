@@ -36,7 +36,9 @@ use modals::{
     draw_shortcut_help,
 };
 use roguelike::draw_roguelike;
-use text::{form_content_height, pad_display_width, render_list, truncate_display_width};
+use text::{
+    form_content_height, log_min_height, pad_display_width, render_list, truncate_display_width,
+};
 use update::draw_update;
 
 const ACCENT: Color = Color::Cyan;
@@ -50,7 +52,7 @@ const LOG_TEXT: Color = Color::Rgb(205, 214, 244);
 const LOG_INFO: Color = Color::Rgb(137, 220, 235);
 const LOG_SUCCESS: Color = Color::Rgb(166, 227, 161);
 const LOG_WARN: Color = Color::Rgb(249, 226, 175);
-const LOG_ERROR: Color = Color::Rgb(243, 139, 168);
+const LOG_ERROR: Color = Color::Rgb(255, 92, 92);
 const LOG_DEBUG: Color = Color::Rgb(147, 153, 178);
 const LOG_TRACE: Color = Color::Rgb(108, 112, 134);
 
@@ -72,7 +74,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .constraints([
                 Constraint::Length(3),
                 form_constraint,
-                Constraint::Min(8),
+                Constraint::Min(log_min_height(area.height)),
                 Constraint::Length(1),
             ])
             .split(area)
@@ -140,9 +142,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         TaskPhase::Running => ("●", "Running", OK),
         TaskPhase::Stopping => ("●", "Stopping", WARN),
     };
-    let status_width = area.width.saturating_sub(28) as usize;
-    let status_text = truncate_display_width(&app.status_text, status_width);
-    let title = Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             " MaaTUI ",
             Style::default()
@@ -154,9 +154,16 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(dot, Style::default().fg(phase_color)),
         Span::raw(" "),
         Span::styled(phase_label, Style::default().fg(phase_color)),
-        Span::raw("  ·  "),
-        Span::styled(status_text, Style::default().fg(Color::Gray)),
-    ]);
+    ];
+    if area.width >= 36 {
+        let status_width = area.width.saturating_sub(28) as usize;
+        spans.push(Span::raw("  ·  "));
+        spans.push(Span::styled(
+            truncate_display_width(&app.status_text, status_width),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+    let title = Line::from(spans);
     frame.render_widget(
         Paragraph::new(title).block(
             Block::default()
@@ -207,6 +214,7 @@ fn draw_main(frame: &mut Frame, app: &App, area: Rect) {
 mod tests {
     use super::*;
     use crate::app::{CopilotTextField, ImportDestination, InputDialog, InputTarget};
+    use crate::copilot::{CopilotOperatorDetail, CopilotOperatorGroup, CopilotSkillActionDetail};
     use chrome::{draw_logs, footer_keys, input_dialog_hint, shortcut_hints};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -226,6 +234,90 @@ mod tests {
     fn warning_and_error_logs_keep_semantic_colors() {
         assert_eq!(log_style(LogLevel::Warn), ("!", LOG_WARN, LOG_WARN));
         assert_eq!(log_style(LogLevel::Error), ("×", LOG_ERROR, LOG_ERROR));
+    }
+
+    #[test]
+    fn error_log_renders_the_whole_line_bold_red() {
+        let mut app = App::new();
+        app.screen = Screen::Daily;
+        app.push_log_to(LogScope::Daily, LogLevel::Error, "failure");
+        let backend = TestBackend::new(30, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| draw_logs(frame, &mut app, frame.area()))
+            .unwrap();
+
+        let cell = terminal.backend().buffer().cell((3, 1)).unwrap();
+        assert_eq!(cell.fg, LOG_ERROR);
+        assert!(cell.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn copilot_detail_uses_compact_tables_in_half_width_terminal() {
+        let operator = CopilotOperatorDetail {
+            name: "圣聆初雪".to_string(),
+            skill: "2".to_string(),
+            usage: "-".to_string(),
+            elite: "2".to_string(),
+            skill_level: "10".to_string(),
+            module: "-1".to_string(),
+            level: "60".to_string(),
+            potential: "-".to_string(),
+        };
+        let mut detail = CopilotDetailDialog {
+            title: "作业集条目详情 · SR-EX-7".to_string(),
+            overview: vec![("关卡名".to_string(), "SR-EX-7".to_string())],
+            operators: vec![operator.clone()],
+            skill_actions: vec![CopilotSkillActionDetail {
+                name: "圣聆初雪".to_string(),
+                times: "1".to_string(),
+                usage: "-".to_string(),
+                trigger: "击杀 20".to_string(),
+                note: "-".to_string(),
+            }],
+            groups: vec![
+                CopilotOperatorGroup {
+                    name: "测试分组".to_string(),
+                    operators: vec![operator],
+                },
+                CopilotOperatorGroup {
+                    name: "空分组".to_string(),
+                    operators: Vec::new(),
+                },
+            ],
+            notes: vec!["无".to_string()],
+            scroll: 0,
+        };
+        let backend = TestBackend::new(60, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| draw_copilot_detail(frame, frame.area(), &mut detail))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .filter(|symbol| !symbol.trim().is_empty())
+            .collect::<String>();
+
+        assert!(rendered.contains("干员配置"), "rendered={rendered:?}");
+        assert!(rendered.contains("技能等级"), "rendered={rendered:?}");
+        assert!(rendered.contains("圣聆初雪"), "rendered={rendered:?}");
+        assert!(rendered.contains("固定"), "rendered={rendered:?}");
+        assert!(rendered.contains("测试分组"), "rendered={rendered:?}");
+        assert!(rendered.contains("空分组"), "rendered={rendered:?}");
+        assert!(!rendered.contains("作业分组·"), "rendered={rendered:?}");
+
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_copilot_detail(frame, frame.area(), &mut detail))
+            .unwrap();
+        assert_eq!(terminal.backend().buffer().area, Rect::new(0, 0, 40, 12));
     }
 
     #[test]

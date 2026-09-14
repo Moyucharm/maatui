@@ -316,9 +316,38 @@ mod tests {
     fn classifies_levels_without_treating_all_stderr_as_warning() {
         assert_eq!(classify_log_line("[ERROR] boom", true).0, LogLevel::Error);
         assert_eq!(classify_log_line("[WARN] caution", true).0, LogLevel::Warn);
+        assert_eq!(
+            classify_log_line("[WARNING] caution", false).0,
+            LogLevel::Warn
+        );
         assert_eq!(classify_log_line("[INFO] normal", true).0, LogLevel::Info);
         assert_eq!(classify_log_line("[DEBUG] detail", true).0, LogLevel::Debug);
         assert_eq!(classify_log_line("[TRACE] trace", true).0, LogLevel::Trace);
+        assert_eq!(classify_log_line("[ERR] boom", false).0, LogLevel::Error);
+        assert_eq!(
+            classify_log_line("[CRITICAL] boom", false).0,
+            LogLevel::Error
+        );
+        assert_eq!(
+            classify_log_line("thread 'main' panicked at src/main.rs", true).0,
+            LogLevel::Error
+        );
+        assert_eq!(
+            classify_log_line("错误：连接失败", false).0,
+            LogLevel::Error
+        );
+        assert_eq!(
+            classify_log_line("[12:00:00] 失败：连接中断", false).0,
+            LogLevel::Error
+        );
+        assert_eq!(
+            classify_log_line("[12:00:00] PANIC: crashed", true).0,
+            LogLevel::Error
+        );
+        assert_eq!(
+            classify_log_line("[12:00:00] EXCEPTION: crashed", true).0,
+            LogLevel::Error
+        );
         assert_eq!(
             classify_log_line("ordinary stderr", true).0,
             LogLevel::Plain

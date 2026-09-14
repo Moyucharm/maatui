@@ -11,7 +11,38 @@ use super::cache::{CopilotCache, CopilotEntry};
 #[derive(Debug, Clone)]
 pub struct CopilotDetail {
     pub title: String,
-    pub lines: Vec<String>,
+    pub overview: Vec<(String, String)>,
+    pub operators: Vec<CopilotOperatorDetail>,
+    pub skill_actions: Vec<CopilotSkillActionDetail>,
+    pub groups: Vec<CopilotOperatorGroup>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CopilotOperatorDetail {
+    pub name: String,
+    pub skill: String,
+    pub usage: String,
+    pub elite: String,
+    pub skill_level: String,
+    pub module: String,
+    pub level: String,
+    pub potential: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CopilotSkillActionDetail {
+    pub name: String,
+    pub times: String,
+    pub usage: String,
+    pub trigger: String,
+    pub note: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CopilotOperatorGroup {
+    pub name: String,
+    pub operators: Vec<CopilotOperatorDetail>,
 }
 
 impl CopilotCache {
@@ -55,47 +86,31 @@ pub(super) fn supported_modes_from_path(entry: &CopilotEntry, path: &Path) -> Re
 }
 
 pub(super) fn format_copilot_detail(entry: &CopilotEntry, content: &JsonValue) -> CopilotDetail {
-    let mut lines = vec![
-        format!("关卡名：{}", entry.stage_name),
-        format!("难度：{}", if entry.is_raid { "突袭" } else { "普通" }),
-        format!("来源：{} · {}", entry.origin.label(), entry.source_label()),
+    let mut overview = vec![
+        ("关卡名".to_string(), entry.stage_name.clone()),
+        (
+            "难度".to_string(),
+            if entry.is_raid { "突袭" } else { "普通" }.to_string(),
+        ),
+        (
+            "来源".to_string(),
+            format!("{} · {}", entry.origin.label(), entry.source_label()),
+        ),
     ];
     if let Some(value) = content.get("minimum_required") {
-        lines.push(format!("最低 Core 版本：{}", json_display(value)));
+        overview.push(("最低 Core 版本".to_string(), json_display(value)));
     }
     if let Some(value) = content.get("version") {
-        lines.push(format!("作业版本：{}", json_display(value)));
+        overview.push(("作业版本".to_string(), json_display(value)));
     }
 
-    lines.push(String::new());
-    lines.push("需要的干员：".to_string());
-    match content.get("opers").and_then(JsonValue::as_array) {
-        Some(opers) if !opers.is_empty() => {
-            for oper in opers {
-                let name = oper
-                    .get("name")
-                    .map(json_display)
-                    .unwrap_or_else(|| "未知干员".to_string());
-                let skill = oper
-                    .get("skill")
-                    .map(json_display)
-                    .map(|skill| format!("技能 {skill}"))
-                    .unwrap_or_else(|| "技能未指定".to_string());
-                let usage = oper
-                    .get("skill_usage")
-                    .map(json_display)
-                    .map(|usage| format!("，模式 {usage}"))
-                    .unwrap_or_default();
-                let requirements = oper
-                    .get("requirements")
-                    .and_then(JsonValue::as_object)
-                    .map(format_operator_requirements)
-                    .unwrap_or_default();
-                lines.push(format!("  · {name} · {skill}{usage}{requirements}"));
-            }
-        }
-        _ => lines.push("  · 未提供干员需求".to_string()),
-    }
+    let operators = content
+        .get("opers")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .map(format_operator)
+        .collect::<Vec<_>>();
 
     let skill_actions = content
         .get("actions")
@@ -105,16 +120,10 @@ pub(super) fn format_copilot_detail(entry: &CopilotEntry, content: &JsonValue) -
         .filter(|action| {
             matches!(
                 action.get("type").and_then(JsonValue::as_str),
-                Some("SkillUsage" | "Skill")
+                Some("SkillUsage" | "Skill" | "技能用法" | "技能")
             )
         })
-        .collect::<Vec<_>>();
-    lines.push(String::new());
-    lines.push("技能使用：".to_string());
-    if skill_actions.is_empty() {
-        lines.push("  · 未记录固定技能使用".to_string());
-    } else {
-        for action in skill_actions {
+        .map(|action| {
             let name = action
                 .get("name")
                 .map(json_display)
@@ -122,86 +131,92 @@ pub(super) fn format_copilot_detail(entry: &CopilotEntry, content: &JsonValue) -
             let times = action
                 .get("skill_times")
                 .map(json_display)
-                .map(|times| format!("，次数 {times}"))
-                .unwrap_or_default();
+                .unwrap_or_else(|| "1".to_string());
             let trigger = [
                 ("kills", "击杀"),
                 ("costs", "费用"),
+                ("cost_changes", "费用变化"),
+                ("cooling", "冷却干员"),
+                ("time_elapsed", "全局计时(ms)"),
                 ("pre_delay", "延迟(ms)"),
+                ("post_delay", "后延迟(ms)"),
             ]
             .iter()
             .filter_map(|(key, label)| {
                 action
                     .get(*key)
-                    .map(|value| format!("，{label} {}", json_display(value)))
+                    .map(|value| format!("{label} {}", json_display(value)))
             })
-            .collect::<String>();
+            .collect::<Vec<_>>()
+            .join(" · ");
             let note = action
                 .get("doc")
                 .and_then(JsonValue::as_str)
                 .filter(|note| !note.trim().is_empty())
-                .map(|note| format!("，备注 {note}"))
-                .unwrap_or_default();
+                .unwrap_or("-")
+                .to_string();
             let usage = action
                 .get("skill_usage")
                 .map(json_display)
-                .map(|usage| format!("，模式 {usage}"))
-                .unwrap_or_default();
-            lines.push(format!("  · {name}{times}{usage}{trigger}{note}"));
-        }
-    }
+                .unwrap_or_else(|| "-".to_string());
+            CopilotSkillActionDetail {
+                name,
+                times,
+                usage,
+                trigger: if trigger.is_empty() {
+                    "-".to_string()
+                } else {
+                    trigger
+                },
+                note,
+            }
+        })
+        .collect::<Vec<_>>();
 
-    if let Some(groups) = content.get("groups").and_then(JsonValue::as_array)
-        && !groups.is_empty()
-    {
-        lines.push(String::new());
-        lines.push("作业分组：".to_string());
-        for group in groups {
+    let groups = content
+        .get("groups")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .map(|group| {
             let name = group
                 .get("name")
                 .map(json_display)
                 .unwrap_or_else(|| "未命名分组".to_string());
-            let opers = group
+            let operators = group
                 .get("opers")
                 .and_then(JsonValue::as_array)
-                .map(|opers| {
-                    opers
-                        .iter()
-                        .map(format_group_operator)
-                        .collect::<Vec<_>>()
-                        .join("；")
-                })
-                .filter(|opers| !opers.is_empty())
-                .map(|opers| format!("：{opers}"))
-                .unwrap_or_default();
-            lines.push(format!("  · {name}{opers}"));
-        }
-    }
+                .into_iter()
+                .flatten()
+                .map(format_operator)
+                .collect();
+            CopilotOperatorGroup { name, operators }
+        })
+        .collect::<Vec<_>>();
 
-    lines.push(String::new());
-    lines.push("备注：".to_string());
     let notes = content
         .pointer("/doc/details")
         .or_else(|| content.pointer("/doc/description"))
         .or_else(|| content.pointer("/documentation/details"))
         .and_then(JsonValue::as_str)
         .unwrap_or("");
-    if notes.trim().is_empty() {
-        lines.push("  · 无".to_string());
+    let notes = if notes.trim().is_empty() {
+        vec!["无".to_string()]
     } else {
-        lines.extend(notes.lines().map(|line| format!("  {line}")));
-    }
+        notes.lines().map(str::to_string).collect()
+    };
 
     CopilotDetail {
         title: entry.display_name(),
-        lines,
+        overview,
+        operators,
+        skill_actions,
+        groups,
+        notes,
     }
 }
 
-fn format_group_operator(oper: &JsonValue) -> String {
-    let Some(oper) = oper.as_object() else {
-        return json_display(oper);
-    };
+fn format_operator(oper: &JsonValue) -> CopilotOperatorDetail {
     let name = oper
         .get("name")
         .map(json_display)
@@ -209,41 +224,40 @@ fn format_group_operator(oper: &JsonValue) -> String {
     let skill = oper
         .get("skill")
         .map(json_display)
-        .map(|skill| format!("技能 {skill}"))
-        .unwrap_or_else(|| "技能未指定".to_string());
+        .unwrap_or_else(|| "0".to_string());
     let usage = oper
         .get("skill_usage")
         .map(json_display)
-        .map(|usage| format!("，模式 {usage}"))
-        .unwrap_or_default();
-    let requirements = oper
-        .get("requirements")
-        .and_then(JsonValue::as_object)
-        .map(format_operator_requirements)
-        .unwrap_or_default();
-    format!("{name}（{skill}{usage}{requirements}）")
-}
-
-fn format_operator_requirements(requirements: &serde_json::Map<String, JsonValue>) -> String {
-    let fields = [
-        ("elite", "精英化"),
-        ("skill_level", "技能等级"),
-        ("module", "模组"),
-        ("level", "等级"),
-        ("potential", "潜能"),
-    ];
-    let values = fields
-        .iter()
-        .filter_map(|(key, label)| {
+        .unwrap_or_else(|| "0".to_string());
+    let requirements = oper.get("requirements").and_then(JsonValue::as_object);
+    let requirement = |key| {
+        requirements
+            .and_then(|requirements| requirements.get(key))
+            .map(json_display)
+            .unwrap_or_else(|| "-".to_string())
+    };
+    let module = requirements
+        .and_then(|requirements| requirements.get("module"))
+        .filter(|module| module.as_i64() != Some(-1))
+        .map(json_display)
+        .unwrap_or_else(|| "-".to_string());
+    let potential = requirements
+        .and_then(|requirements| {
             requirements
-                .get(*key)
-                .map(|value| format!("{label} {}", json_display(value)))
+                .get("potentiality")
+                .or_else(|| requirements.get("potential"))
         })
-        .collect::<Vec<_>>();
-    if values.is_empty() {
-        String::new()
-    } else {
-        format!(" · {}", values.join(" · "))
+        .map(json_display)
+        .unwrap_or_else(|| "-".to_string());
+    CopilotOperatorDetail {
+        name,
+        skill,
+        usage,
+        elite: requirement("elite"),
+        skill_level: requirement("skill_level"),
+        module,
+        level: requirement("level"),
+        potential,
     }
 }
 

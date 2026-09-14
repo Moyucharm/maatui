@@ -58,12 +58,14 @@ fn draw_control(frame: &mut Frame, app: &App, area: Rect) {
         app.roguelike_idx == 0,
         "开始自动肉鸽",
         "maa run <temporary-task> --batch -v",
+        area.width,
     )];
     items.extend(fields.iter().enumerate().map(|(index, field)| {
         field_item(
             app.roguelike_idx == index + 1,
             field.label(),
             &app.roguelike_field_display(*field),
+            area.width,
         )
     }));
     render_list(frame, area, " 控制面板 ", items, app.roguelike_idx);
@@ -88,6 +90,7 @@ fn draw_advanced(frame: &mut Frame, app: &App, area: Rect) {
                 app.roguelike_advanced_idx == index,
                 field.label(),
                 &app.roguelike_field_display(*field),
+                area.width,
             )
         })
         .collect();

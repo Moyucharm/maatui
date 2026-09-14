@@ -20,9 +20,20 @@ pub(super) fn render_list(
     draw_vscrollbar(frame, inner, item_count, state.offset() as u16);
 }
 
-const FIELD_LABEL_WIDTH: usize = 20;
-
-pub(super) fn field_item(selected: bool, label: &str, value: &str) -> ListItem<'static> {
+pub(super) fn field_item(
+    selected: bool,
+    label: &str,
+    value: &str,
+    area_width: u16,
+) -> ListItem<'static> {
+    let inner_width = area_width.saturating_sub(2) as usize;
+    let label_width = match area_width {
+        0..=43 => 10,
+        44..=71 => 14,
+        _ => 20,
+    }
+    .min(inner_width.saturating_sub(2));
+    let value_width = inner_width.saturating_sub(2 + label_width);
     let label_style = if selected {
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
     } else {
@@ -30,9 +41,12 @@ pub(super) fn field_item(selected: bool, label: &str, value: &str) -> ListItem<'
     };
     ListItem::new(Line::from(vec![
         Span::styled(if selected { "▶ " } else { "  " }, label_style),
-        Span::styled(pad_display_width(label, FIELD_LABEL_WIDTH), label_style),
         Span::styled(
-            value.to_string(),
+            pad_display_width(&truncate_display_width(label, label_width), label_width),
+            label_style,
+        ),
+        Span::styled(
+            truncate_display_width(value, value_width),
             Style::default().fg(if selected { Color::White } else { MUTED }),
         ),
     ]))
@@ -72,18 +86,26 @@ pub(super) fn panel<'a>(title: &'a str) -> Block<'a> {
         .title(Span::styled(title, Style::default().fg(ACCENT)))
 }
 
-/// Idle + 日志页的表单高度：内容行 + 上下边框，并给日志至少留 8 行。
+pub(super) fn log_min_height(total_height: u16) -> u16 {
+    match total_height {
+        0..=13 => 3,
+        14..=19 => 5,
+        _ => 8,
+    }
+}
+
+/// Idle + 日志页的表单高度：内容行 + 上下边框，并为日志保留自适应空间。
 pub(super) fn form_content_height(app: &App, total_height: u16) -> u16 {
     const HEADER: u16 = 3;
     const FOOTER: u16 = 1;
-    const LOGS_MIN: u16 = 8;
     const FORM_MIN: u16 = 4;
     const BORDER: u16 = 2;
+    let logs_min = log_min_height(total_height);
 
     if app.screen == Screen::Update {
         let usable = total_height.saturating_sub(HEADER + FOOTER);
         let desired = usable.saturating_mul(2) / 3;
-        return desired.clamp(FORM_MIN, usable.saturating_sub(LOGS_MIN).max(FORM_MIN));
+        return desired.clamp(FORM_MIN, usable.saturating_sub(logs_min).max(FORM_MIN));
     }
 
     let rows = match app.screen {
@@ -111,7 +133,7 @@ pub(super) fn form_content_height(app: &App, total_height: u16) -> u16 {
         Screen::Update => unreachable!("更新页已使用专用布局"),
     };
     let desired = rows.saturating_add(BORDER).max(FORM_MIN);
-    let reserved = HEADER.saturating_add(FOOTER).saturating_add(LOGS_MIN);
+    let reserved = HEADER.saturating_add(FOOTER).saturating_add(logs_min);
     let available = total_height.saturating_sub(reserved).max(FORM_MIN);
     desired.min(available)
 }

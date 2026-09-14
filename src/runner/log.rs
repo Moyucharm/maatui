@@ -49,9 +49,20 @@ pub(super) fn spawn_reader<R: std::io::Read + Send + 'static>(
 pub fn classify_log_line(raw: &str, _is_stderr: bool) -> (LogLevel, String) {
     let text = strip_str(raw);
     let upper = text.to_ascii_uppercase();
-    let level = if contains_level(&upper, "ERROR") {
+    let trimmed = text.trim_start();
+    let trimmed_upper = upper.trim_start();
+    let level = if ["ERROR", "ERR", "FATAL", "CRITICAL"]
+        .iter()
+        .any(|level| contains_level(&upper, level))
+        || message_starts_with(trimmed_upper, "PANIC:")
+        || upper.contains("PANICKED AT")
+        || message_starts_with(trimmed_upper, "EXCEPTION:")
+        || ["错误:", "错误：", "失败:", "失败："]
+            .iter()
+            .any(|prefix| message_starts_with(trimmed, prefix))
+    {
         LogLevel::Error
-    } else if contains_level(&upper, "WARN") {
+    } else if contains_level(&upper, "WARN") || contains_level(&upper, "WARNING") {
         LogLevel::Warn
     } else if contains_level(&upper, "DEBUG") {
         LogLevel::Debug
@@ -72,4 +83,8 @@ fn contains_level(text: &str, level: &str) -> bool {
     text.contains(&format!("[{level}]"))
         || text.contains(&format!(" {level} "))
         || text.starts_with(&format!("{level}:"))
+}
+
+fn message_starts_with(text: &str, prefix: &str) -> bool {
+    text.starts_with(prefix) || text.contains(&format!("] {prefix}"))
 }

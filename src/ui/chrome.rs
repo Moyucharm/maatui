@@ -34,7 +34,11 @@ pub(super) fn draw_running_control(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         OK
     };
-    let stop = "[ Esc / Enter / s ] 停止任务";
+    let stop = if area.width < 58 {
+        "[Esc] 停止"
+    } else {
+        "[ Esc / Enter / s ] 停止任务"
+    };
     let inner_width = area.width.saturating_sub(2) as usize;
     let progress_width = inner_width.saturating_sub(stop.width());
     let progress = if progress_width > 2 {
@@ -87,6 +91,11 @@ pub(super) fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|log| {
             let (prefix, level_color, text_color) = log_style(log.level);
+            let text_style = if log.level == LogLevel::Error {
+                Style::default().fg(text_color).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(text_color)
+            };
             Line::from(vec![
                 Span::styled(
                     format!("{prefix} "),
@@ -94,7 +103,7 @@ pub(super) fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
                         .fg(level_color)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(log.text.clone(), Style::default().fg(text_color)),
+                Span::styled(log.text.clone(), text_style),
             ])
         })
         .collect();

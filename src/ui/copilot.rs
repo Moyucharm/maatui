@@ -130,18 +130,44 @@ pub(super) fn draw_copilot_list(frame: &mut Frame, app: &App, area: Rect) {
                 let enabled_color = if entry.enabled { OK } else { MUTED };
                 let difficulty = if entry.is_raid { "突袭" } else { "普通" };
                 let difficulty_color = if entry.is_raid { WARN } else { LOG_INFO };
+                let inner_width = area.width.saturating_sub(2) as usize;
+                let stage_width = if area.width < 64 { 10 } else { 12 };
+                let fixed_width = 2 + 5 + 6 + stage_width;
                 let source = format!("{}  {}", entry.origin.label(), entry.source_label());
-                Some(ListItem::new(Line::from(vec![
+                let show_source = area.width >= 72;
+                let source_width = if show_source {
+                    (inner_width.saturating_sub(fixed_width) / 3).clamp(10, 24)
+                } else {
+                    0
+                };
+                let title_width = inner_width
+                    .saturating_sub(fixed_width + source_width + usize::from(show_source) * 2);
+                let mut spans = vec![
                     Span::styled(if selected { "▶ " } else { "  " }, style),
                     Span::styled(format!("{enabled:<5}"), Style::default().fg(enabled_color)),
                     Span::styled(
                         format!("{difficulty:<6}"),
                         Style::default().fg(difficulty_color),
                     ),
-                    Span::styled(pad_display_width(&entry.stage_name, 12), style),
-                    Span::styled(entry.display_name(), style),
-                    Span::styled(format!("  {source}"), Style::default().fg(MUTED)),
-                ])))
+                    Span::styled(
+                        pad_display_width(
+                            &truncate_display_width(&entry.stage_name, stage_width),
+                            stage_width,
+                        ),
+                        style,
+                    ),
+                    Span::styled(
+                        truncate_display_width(&entry.display_name(), title_width),
+                        style,
+                    ),
+                ];
+                if show_source {
+                    spans.push(Span::styled(
+                        format!("  {}", truncate_display_width(&source, source_width)),
+                        Style::default().fg(MUTED),
+                    ));
+                }
+                Some(ListItem::new(Line::from(spans)))
             })
             .collect()
     };
@@ -183,7 +209,9 @@ pub(super) fn draw_copilot_settings(frame: &mut Frame, app: &App, area: Rect) {
     let items = rows
         .iter()
         .enumerate()
-        .map(|(index, (label, value))| field_item(index == app.copilot_settings_idx, label, value))
+        .map(|(index, (label, value))| {
+            field_item(index == app.copilot_settings_idx, label, value, area.width)
+        })
         .collect();
     render_list(frame, area, " 运行设置 ", items, app.copilot_settings_idx);
 }

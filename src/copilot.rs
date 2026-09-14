@@ -9,7 +9,9 @@ pub use batch::{BatchTask, CopilotRunOptions, remove_batch_task, write_batch_tas
 #[cfg(test)]
 pub use cache::CopilotEntrySource;
 pub use cache::{CopilotCache, CopilotEntry, CopilotOptions, CopilotOrigin};
-pub use detail::CopilotDetail;
+pub use detail::{
+    CopilotDetail, CopilotOperatorDetail, CopilotOperatorGroup, CopilotSkillActionDetail,
+};
 pub use import::{ImportKind, ImportProgress, ImportReport, import_source};
 
 #[cfg(test)]
@@ -526,17 +528,28 @@ mod tests {
                 "doc": {"details": "备注一\n备注二"}
             }),
         );
-        let text = detail.lines.join("\n");
-        assert!(text.contains("关卡名：TO-9"));
-        assert!(text.contains("难度：突袭"));
-        assert!(text.contains("逻各斯 · 技能 3"));
-        assert!(text.contains("模组 4"));
-        assert!(text.contains("替补组：阿米娅（技能 2"));
-        assert!(text.contains("次数 2"));
-        assert!(text.contains("击杀 10"));
-        assert!(text.contains("延迟(ms) 1500"));
-        assert!(text.contains("等待敌人出现"));
-        assert!(text.contains("备注一"));
+        assert!(
+            detail
+                .overview
+                .iter()
+                .any(|(label, value)| label == "关卡名" && value == "TO-9")
+        );
+        assert!(
+            detail
+                .overview
+                .iter()
+                .any(|(label, value)| label == "难度" && value == "突袭")
+        );
+        assert_eq!(detail.operators[0].name, "逻各斯");
+        assert_eq!(detail.operators[0].skill, "3");
+        assert_eq!(detail.operators[0].module, "4");
+        assert_eq!(detail.groups[0].name, "替补组");
+        assert_eq!(detail.groups[0].operators[0].name, "阿米娅");
+        assert_eq!(detail.skill_actions[0].times, "2");
+        assert!(detail.skill_actions[0].trigger.contains("击杀 10"));
+        assert!(detail.skill_actions[0].trigger.contains("延迟(ms) 1500"));
+        assert_eq!(detail.skill_actions[0].note, "等待敌人出现");
+        assert_eq!(detail.notes[0], "备注一");
     }
 
     #[test]

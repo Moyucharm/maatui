@@ -214,12 +214,39 @@ MaaTUI 强制使用 `MAA_LOG_PREFIX=Always` 获取可解析的日志等级，并
 
 ## 构建与运行
 
+### 下载发布版
+
+从 [GitHub Releases](https://github.com/Moyucharm/maatui/releases) 下载对应版本。以 `v0.1.1` 为例：
+
+```bash
+curl -LO https://github.com/Moyucharm/maatui/releases/download/v0.1.1/maatui-v0.1.1-x86_64-unknown-linux-gnu.tar.gz
+curl -LO https://github.com/Moyucharm/maatui/releases/download/v0.1.1/maatui-v0.1.1-x86_64-unknown-linux-gnu.tar.gz.sha256
+sha256sum -c maatui-v0.1.1-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf maatui-v0.1.1-x86_64-unknown-linux-gnu.tar.gz
+install -Dm755 maatui "$HOME/.local/bin/maatui"
+```
+
+确认 `$HOME/.local/bin` 已加入 `PATH`，然后执行 `maatui`。
+
+### 从源码构建
+
 ```bash
 cargo build --release
 ./target/release/maatui
 # 或
 cargo run --release
 ```
+
+## 发布
+
+GitHub Actions 会在推送 `v*` 标签时验证、构建并创建 GitHub Release。标签版本必须与 `Cargo.toml` 中的版本一致：
+
+```bash
+git tag -a v0.1.1 -m "MaaTUI v0.1.1"
+git push origin v0.1.1
+```
+
+发布产物包括 Linux x86_64 二进制压缩包及其 SHA-256 校验文件。
 
 ## 快捷键
 

@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build and release Linux binary
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Verify tag version
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          package_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "maatui") | .version')"
+          if [[ "$tag_version" != "$package_version" ]]; then
+            echo "Tag version $tag_version does not match Cargo package version $package_version" >&2
+            exit 1
+          fi
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Build release binary
+        run: cargo build --locked --release
+
+      - name: Package release
+        shell: bash
+        run: |
+          archive="maatui-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz"
+          mkdir -p dist/package
+          install -m 755 target/release/maatui dist/package/maatui
+          cp README.md CHANGELOG.md LICENSE dist/package/
+          tar -C dist/package -czf "dist/$archive" maatui README.md CHANGELOG.md LICENSE
+          cd dist
+          sha256sum "$archive" > "$archive.sha256"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256

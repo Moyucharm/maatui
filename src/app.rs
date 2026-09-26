@@ -66,6 +66,7 @@ pub use state::*;
 use state::{CopilotImportEvent, DailyRunState, SelectBehavior, option_label};
 #[cfg(test)]
 pub(crate) use task_lifecycle::fully_disabled_chains;
+use task_lifecycle::localize_task_log;
 #[cfg(test)]
 pub(crate) use task_lifecycle::log_scope_for_command;
 
@@ -160,6 +161,8 @@ impl App {
             task: None,
             active_task_kind: None,
             task_abort_error: None,
+            pending_core_failure: None,
+            copilot_core_failure: None,
             notification_worker: NotificationWorker::new().ok(),
             daily_run: None,
             disabled_task_chains: Vec::new(),
@@ -310,6 +313,19 @@ impl App {
                 self.saw_outdated_resource_error = true;
             }
         }
+        let text = if scope == self.active_log_scope && self.phase != TaskPhase::Idle {
+            match self.active_task_kind {
+                Some(kind @ (TaskKind::Daily | TaskKind::Copilot)) => {
+                    match localize_task_log(&text, kind) {
+                        std::borrow::Cow::Borrowed(_) => text,
+                        std::borrow::Cow::Owned(localized) => localized,
+                    }
+                }
+                _ => text,
+            }
+        } else {
+            text
+        };
         let buffer = self.log_buffer_mut(scope);
         buffer.lines.push_back(LogLine { level, text });
         while buffer.lines.len() > MAX_LOG_LINES {

@@ -43,6 +43,21 @@ impl RunningTask {
         Self::spawn_command_with_env(program, args, &[], None)
     }
 
+    /// 测试专用：用指定目录作为 MaaCore 日志目录实例化真实轮询器。
+    #[cfg(test)]
+    pub fn spawn_command_with_core_log_in_dir(
+        program: &str,
+        args: &[&str],
+        dir: &std::path::Path,
+        track_daily: bool,
+        track_copilot: bool,
+    ) -> Result<Self, String> {
+        let core_log = (track_daily || track_copilot)
+            .then(|| CoreLogCursor::prepare_in_dir(dir, track_daily, track_copilot))
+            .transpose()?;
+        Self::spawn_command_with_env(program, args, &[], core_log)
+    }
+
     fn spawn_command_with_env(
         program: &str,
         args: &[&str],
@@ -175,6 +190,31 @@ impl RunningTask {
                 CoreProgressEvent::DailyTaskStarted { task_id, taskchain } => {
                     RunnerEvent::DailyTaskStarted { task_id, taskchain }
                 }
+                CoreProgressEvent::SubTaskFailure {
+                    task_id,
+                    taskchain,
+                    reason,
+                } => RunnerEvent::SubTaskFailure {
+                    task_id,
+                    taskchain,
+                    reason,
+                },
+                CoreProgressEvent::TaskChainFailed {
+                    task_id,
+                    taskchain,
+                    error,
+                } => RunnerEvent::TaskChainFailed {
+                    task_id,
+                    taskchain,
+                    error,
+                },
+                CoreProgressEvent::TaskChainSucceeded { task_id, taskchain } => {
+                    RunnerEvent::TaskChainSucceeded { task_id, taskchain }
+                }
+                CoreProgressEvent::CopilotTaskStarted { task_id } => {
+                    RunnerEvent::CopilotTaskStarted { task_id }
+                }
+                CoreProgressEvent::DailyTasksCompleted => RunnerEvent::DailyTasksCompleted,
                 CoreProgressEvent::CopilotStageSucceeded => RunnerEvent::CopilotStageSucceeded,
             })),
             Err(error) => {

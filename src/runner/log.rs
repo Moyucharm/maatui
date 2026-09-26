@@ -46,12 +46,47 @@ pub(super) fn spawn_reader<R: std::io::Read + Send + 'static>(
         .map(|_| ())
 }
 
+/// 仅识别 maa-cli 的完整时间戳及等级前缀，避免把正文中的等级词当作级别。
+pub(crate) fn maa_cli_log_parts(text: &str) -> Option<(&str, &str, LogLevel)> {
+    let bytes = text.as_bytes();
+    if bytes.len() < 27
+        || bytes.first() != Some(&b'[')
+        || ![1, 2, 3, 4, 6, 7, 9, 10, 12, 13, 15, 16, 18, 19]
+            .iter()
+            .all(|&i| bytes[i].is_ascii_digit())
+        || ![
+            (5, b'-'),
+            (8, b'-'),
+            (11, b' '),
+            (14, b':'),
+            (17, b':'),
+            (20, b' '),
+        ]
+        .iter()
+        .all(|&(i, value)| bytes[i] == value)
+    {
+        return None;
+    }
+    let end = text[21..].find("] ")? + 21;
+    let level = match &text[21..end] {
+        "ERROR" => LogLevel::Error,
+        "WARN" => LogLevel::Warn,
+        "INFO" => LogLevel::Info,
+        "DEBUG" => LogLevel::Debug,
+        "TRACE" => LogLevel::Trace,
+        _ => return None,
+    };
+    Some((&text[..end + 2], &text[end + 2..], level))
+}
+
 pub fn classify_log_line(raw: &str, _is_stderr: bool) -> (LogLevel, String) {
     let text = strip_str(raw);
     let upper = text.to_ascii_uppercase();
     let trimmed = text.trim_start();
     let trimmed_upper = upper.trim_start();
-    let level = if ["ERROR", "ERR", "FATAL", "CRITICAL"]
+    let level = if let Some((_, _, level)) = maa_cli_log_parts(&text) {
+        level
+    } else if ["ERROR", "ERR", "FATAL", "CRITICAL"]
         .iter()
         .any(|level| contains_level(&upper, level))
         || message_starts_with(trimmed_upper, "PANIC:")

@@ -2,6 +2,95 @@
 
 use super::*;
 use crate::config::TaskSummary;
+use std::borrow::Cow;
+
+/// 只翻译完整的已知回调消息；未知诊断和时间戳保持原文。
+pub(super) fn localize_task_log(text: &str, kind: TaskKind) -> Cow<'_, str> {
+    let (prefix, message) = crate::runner::maa_cli_log_parts(text)
+        .map_or(("", text), |(prefix, message, _)| (prefix, message));
+    if message.to_ascii_lowercase().contains("tile-pos") {
+        return Cow::Borrowed(text);
+    }
+
+    let exact = match message {
+        "AllTasksCompleted" => Some("所有任务已结束"),
+        "Connected" => Some("已连接"),
+        "Mission started" => Some("作战已开始"),
+        "EnterFacility" => Some("进入设施"),
+        "NotEnoughStaff" => Some("可用干员不足"),
+        "FailedToStartGame" => Some("启动游戏失败"),
+        "FailedToRecognizeDrops" => Some("识别掉落失败"),
+        "StageInfoError" => Some("关卡信息错误"),
+        "ScreencapFailed" => Some("截图失败"),
+        "UnsupportedResolution" => Some("不支持的分辨率"),
+        "ResolutionAcquisitionFailure" => Some("获取分辨率失败"),
+        "Some error occurred during running task!" => Some("任务运行过程中发生错误！"),
+        "UnsupportedLevel" if kind == TaskKind::Copilot => Some("不支持的关卡"),
+        _ => None,
+    };
+    if let Some(value) = exact {
+        return Cow::Owned(format!("{prefix}{value}"));
+    }
+    if let Some((chain, state)) = message.split_once(' ') {
+        let label = task_type_label(chain);
+        if label != chain {
+            let state = match state {
+                "Start" => Some("开始"),
+                "Completed" => Some("完成"),
+                "Stopped" => Some("已停止"),
+                "Error" => Some("执行失败"),
+                _ => None,
+            };
+            if let Some(state) = state {
+                return Cow::Owned(format!("{prefix}{label} {state}"));
+            }
+        }
+    }
+    for (source, target) in [
+        ("Current sanity:", "当前理智："),
+        ("Drops:", "掉落："),
+        ("RecruitResult:", "招募结果："),
+        ("EnterFacility ", "进入设施 "),
+        ("NotEnoughStaff ", "可用干员不足 "),
+    ] {
+        if let Some(rest) = message.strip_prefix(source) {
+            return Cow::Owned(format!("{prefix}{target}{}", rest.trim_start()));
+        }
+    }
+    if kind == TaskKind::Copilot {
+        for (source, target) in [
+            ("BattleFormation ", "自动编队："),
+            ("BattleFormationSelected ", "已选干员："),
+        ] {
+            if let Some(rest) = message.strip_prefix(source) {
+                return Cow::Owned(format!("{prefix}{target}{rest}"));
+            }
+        }
+        if let Some(rest) = message.strip_prefix("CurrentSteps ")
+            && let Some((action, target)) = rest.split_once(' ')
+        {
+            let action = match action {
+                "Deploy" => "部署",
+                "UseSkill" => "使用技能",
+                "Retreat" => "撤退",
+                "SwitchSpeed" => "切换速度",
+                _ => action,
+            };
+            return Cow::Owned(format!("{prefix}当前操作：{action} {target}"));
+        }
+    }
+    Cow::Borrowed(text)
+}
+
+/// 后续更泛化的「关卡导航失败」不覆盖已带首项的具体线索。
+pub(super) fn merge_failure_reason(previous: Option<&str>, reason: String) -> String {
+    match previous {
+        Some(previous) if previous.starts_with("关卡导航失败（") && reason == "关卡导航失败" => {
+            previous.to_string()
+        }
+        _ => reason,
+    }
+}
 
 pub(crate) fn log_scope_for_command(command: &TaskCommand) -> LogScope {
     match command.kind {
@@ -50,6 +139,8 @@ impl App {
         self.last_failed = false;
         self.active_task_kind = None;
         self.task_abort_error = None;
+        self.pending_core_failure = None;
+        self.copilot_core_failure = None;
         self.saw_outdated_resource_error = false;
         self.saw_ocr_to_t0_error = false;
         self.disabled_task_chains.clear();
@@ -81,7 +172,12 @@ impl App {
                 total,
                 label: "等待任务开始".to_string(),
             });
-            self.daily_run = Some(DailyRunState { tasks, total });
+            self.daily_run = Some(DailyRunState {
+                tasks,
+                total,
+                failed: Vec::new(),
+                completed: false,
+            });
         }
         self.temp_task_file = command.cleanup.clone();
         self.pending_resource_check = is_resource_update_command(&command);
@@ -220,6 +316,44 @@ impl App {
                 RunnerEvent::DailyTaskStarted { task_id, taskchain } => {
                     self.on_daily_task_started(task_id, &taskchain)
                 }
+                RunnerEvent::SubTaskFailure {
+                    task_id,
+                    taskchain,
+                    reason,
+                } => {
+                    let reason = merge_failure_reason(
+                        self.pending_core_failure
+                            .as_ref()
+                            .filter(|(id, chain, _)| *id == task_id && chain == &taskchain)
+                            .map(|(_, _, previous)| previous.as_str()),
+                        reason,
+                    );
+                    self.pending_core_failure = Some((task_id, taskchain, reason));
+                }
+                RunnerEvent::TaskChainFailed {
+                    task_id,
+                    taskchain,
+                    error,
+                } => {
+                    self.on_task_chain_failed(task_id, &taskchain, error);
+                }
+                RunnerEvent::TaskChainSucceeded { task_id, taskchain } => {
+                    self.clear_pending_core_failure(task_id, &taskchain);
+                }
+                RunnerEvent::CopilotTaskStarted { task_id } => {
+                    if self
+                        .pending_core_failure
+                        .as_ref()
+                        .is_some_and(|(id, _, _)| *id != task_id)
+                    {
+                        self.pending_core_failure = None;
+                    }
+                }
+                RunnerEvent::DailyTasksCompleted => {
+                    if let Some(state) = self.daily_run.as_mut() {
+                        state.completed = true;
+                    }
+                }
                 RunnerEvent::CopilotStageSucceeded => self.on_copilot_stage_succeeded(),
                 RunnerEvent::ProgressFailed(error) => {
                     let message = format!("读取 MaaCore 运行进度失败，已停止任务: {error}");
@@ -283,36 +417,123 @@ impl App {
         })
     }
 
-    pub(crate) fn on_daily_task_started(&mut self, task_id: usize, taskchain: &str) {
+    pub(crate) fn daily_task_label(&self, task_id: usize, taskchain: &str) -> String {
         let Some(state) = self.daily_run.as_ref() else {
-            return;
+            return task_type_label(taskchain).to_string();
         };
-        let total = state.total;
-        // 防御：当前进度不超过分母（taskid 语义在不同 maa 版本下可能保留关闭任务的序号）。
-        let current = task_id.min(total);
-        let index = task_id.saturating_sub(1);
-        let enabled_index = current.saturating_sub(1);
-        // 优先按实际启用任务顺序取名称，避免关闭任务穿插及同类型任务重复时错位；
-        // 若回调使用原配置索引，则退回原始索引匹配，最后使用任务类型标签。
-        let label = state
+        let current = task_id.min(state.total);
+        state
             .tasks
             .iter()
             .filter(|task| task.enabled)
-            .nth(enabled_index)
+            .nth(current.saturating_sub(1))
             .filter(|task| task.task_type == taskchain)
             .or_else(|| {
                 state
                     .tasks
-                    .get(index)
+                    .get(task_id.saturating_sub(1))
                     .filter(|task| task.task_type == taskchain)
             })
+            .or_else(|| {
+                (state.tasks.len() == 1 && state.tasks[0].task_type == taskchain)
+                    .then(|| &state.tasks[0])
+            })
             .map(|task| task.name.clone())
-            .unwrap_or_else(|| task_type_label(taskchain).to_string());
+            .unwrap_or_else(|| task_type_label(taskchain).to_string())
+    }
+
+    pub(crate) fn on_daily_task_started(&mut self, task_id: usize, taskchain: &str) {
+        self.clear_pending_core_failure_except(task_id, taskchain);
+        let Some(state) = self.daily_run.as_ref() else {
+            return;
+        };
+        let total = state.total;
+        let current = task_id.min(total);
+        let label = self.daily_task_label(task_id, taskchain);
         self.run_progress = Some(RunProgress {
             current,
             total,
             label,
         });
+    }
+
+    fn clear_pending_core_failure_except(&mut self, task_id: usize, taskchain: &str) {
+        if self
+            .pending_core_failure
+            .as_ref()
+            .is_some_and(|(id, chain, _)| *id != task_id || chain != taskchain)
+        {
+            self.pending_core_failure = None;
+        }
+    }
+
+    pub(super) fn clear_pending_core_failure(&mut self, task_id: usize, taskchain: &str) {
+        if self
+            .pending_core_failure
+            .as_ref()
+            .is_some_and(|(id, chain, _)| *id == task_id && chain == taskchain)
+        {
+            self.pending_core_failure = None;
+        }
+    }
+
+    pub(crate) fn on_task_chain_failed(
+        &mut self,
+        task_id: usize,
+        taskchain: &str,
+        error: Option<String>,
+    ) {
+        let reason = if self
+            .pending_core_failure
+            .as_ref()
+            .is_some_and(|(id, chain, _)| *id == task_id && chain == taskchain)
+        {
+            self.pending_core_failure
+                .take()
+                .map(|(_, _, reason)| reason)
+        } else {
+            None
+        }
+        .or(error)
+        .unwrap_or_else(|| {
+            if taskchain == "Copilot" {
+                "自动战斗中失败".to_string()
+            } else {
+                "任务执行失败".to_string()
+            }
+        });
+        if taskchain == "Copilot" && self.active_task_kind == Some(TaskKind::Copilot) {
+            if self.copilot_core_failure.is_none() {
+                self.push_log_to(
+                    LogScope::Copilot,
+                    LogLevel::Error,
+                    format!("自动战斗 · 执行失败：{reason}"),
+                );
+                self.copilot_core_failure = Some(reason);
+            }
+        } else if self.active_task_kind == Some(TaskKind::Daily) {
+            let label = self.daily_task_label(task_id, taskchain);
+            let Some(state) = self.daily_run.as_mut() else {
+                return;
+            };
+            if state.failed.iter().any(|(id, _)| *id == task_id) {
+                return;
+            }
+            state.failed.push((task_id, label.clone()));
+            self.push_log_to(
+                LogScope::Daily,
+                LogLevel::Error,
+                format!("每日任务 · {label} · 执行失败：{reason}"),
+            );
+            self.send_task_notification(
+                TaskKind::Daily,
+                "每日任务",
+                TaskOutcome::DailyItemFailed {
+                    name: &label,
+                    detail: &reason,
+                },
+            );
+        }
     }
 
     pub(crate) fn on_copilot_stage_succeeded(&mut self) {
@@ -392,6 +613,21 @@ impl App {
         let task_kind = self.active_task_kind.take();
         let task_label = self.active_label.clone();
         let task_abort_error = self.task_abort_error.take();
+        let core_failure = self.copilot_core_failure.take();
+        self.pending_core_failure = None;
+        let failed_names = self
+            .daily_run
+            .as_ref()
+            .map(|run| {
+                run.failed
+                    .iter()
+                    .map(|(_, name)| name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("、")
+            })
+            .unwrap_or_default();
+        let daily_failed = !failed_names.is_empty();
+        let daily_completed = self.daily_run.as_ref().is_some_and(|run| run.completed);
         let check_resource = self.pending_resource_check;
         let version_before = self.resource_version_before.take();
         self.pending_resource_check = false;
@@ -421,15 +657,21 @@ impl App {
             remove_batch_task(&exit.task_path);
         }
 
-        let manually_stopped = stopped
-            && task_abort_error.is_none()
+        let no_internal_error = task_abort_error.is_none()
             && batch_abort_error.is_none()
             && batch_state_error.is_none();
+        let manually_stopped = stopped && no_internal_error;
+        let partially_completed = !stopped
+            && task_kind == Some(TaskKind::Daily)
+            && daily_failed
+            && daily_completed
+            && matches!(code, Some(0 | 1))
+            && no_internal_error;
         let completed = !stopped
             && code == Some(0)
-            && task_abort_error.is_none()
-            && batch_abort_error.is_none()
-            && batch_state_error.is_none();
+            && no_internal_error
+            && !daily_failed
+            && core_failure.is_none();
         let failure_detail = task_abort_error
             .clone()
             .or_else(|| batch_abort_error.clone())
@@ -438,6 +680,7 @@ impl App {
                     .as_ref()
                     .map(|error| format!("保存作业列表失败: {error}"))
             })
+            .or_else(|| core_failure.clone())
             .unwrap_or_else(|| format!("{task_label}异常结束 (exit {code_text})"));
 
         if manually_stopped {
@@ -447,6 +690,13 @@ impl App {
             );
             self.status_text = format!("已停止 · exit {code_text}");
             self.last_failed = false;
+        } else if partially_completed {
+            self.push_log(
+                LogLevel::Warn,
+                format!("每日任务已完成，部分过程失败：{failed_names}"),
+            );
+            self.status_text = "已完成 · 部分过程失败".to_string();
+            self.last_failed = true;
         } else if completed {
             self.push_log(
                 LogLevel::Success,
@@ -460,7 +710,14 @@ impl App {
         } else {
             self.push_log(
                 LogLevel::Error,
-                format!("{}异常结束 (exit {code_text})", self.active_label),
+                if core_failure.is_some() {
+                    format!(
+                        "{}异常结束 (exit {code_text})：{failure_detail}",
+                        self.active_label
+                    )
+                } else {
+                    format!("{}异常结束 (exit {code_text})", self.active_label)
+                },
             );
             self.status_text = format!("失败 · exit {code_text}");
             self.last_failed = true;
@@ -480,6 +737,10 @@ impl App {
         if let Some(kind) = task_kind {
             let outcome = if manually_stopped {
                 TaskOutcome::ManuallyStopped
+            } else if partially_completed {
+                TaskOutcome::DailyPartiallyCompleted {
+                    failed_names: &failed_names,
+                }
             } else if completed {
                 TaskOutcome::Completed
             } else {

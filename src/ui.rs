@@ -254,6 +254,50 @@ mod tests {
     }
 
     #[test]
+    fn localized_failure_line_renders_fully_red_and_bold() {
+        let mut app = App::new();
+        app.screen = Screen::Daily;
+        app.push_log_to(
+            LogScope::Daily,
+            LogLevel::Error,
+            "每日任务 · 刷理智 · 执行失败：关卡导航失败（1-7）",
+        );
+        let backend = TestBackend::new(60, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| draw_logs(frame, &mut app, frame.area()))
+            .unwrap();
+
+        // 日志区首行带前缀标记，正文从第 3 列开始；整行错误色加粗。
+        // 宽字符的续列由终端占据且不携带样式，因此只检查真实承载文字的单元。
+        let buffer = terminal.backend().buffer();
+        let mut checked = 0;
+        for column in 3..40 {
+            let cell = buffer.cell((column, 1)).unwrap();
+            let symbol = cell.symbol();
+            let is_lead_cell = !symbol.trim().is_empty() && symbol != " ";
+            if !is_lead_cell {
+                continue;
+            }
+            assert_eq!(cell.fg, LOG_ERROR, "column={column} symbol={symbol:?}");
+            assert!(
+                cell.modifier.contains(Modifier::BOLD),
+                "column={column} symbol={symbol:?}"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 15, "checked={checked}");
+        let rendered: String = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .filter(|symbol| *symbol != " ")
+            .collect();
+        assert!(rendered.contains("执行失败"), "rendered={rendered}");
+    }
+
+    #[test]
     fn copilot_detail_uses_compact_tables_in_half_width_terminal() {
         let operator = CopilotOperatorDetail {
             name: "圣聆初雪".to_string(),

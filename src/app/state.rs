@@ -30,6 +30,8 @@ pub(super) struct DailyRunState {
     pub(super) tasks: Vec<TaskSummary>,
     /// 进度分母：仅统计启用的任务。
     pub(super) total: usize,
+    pub(super) failed: Vec<(usize, String)>,
+    pub(super) completed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -467,6 +469,8 @@ pub struct App {
     pub(super) task: Option<RunningTask>,
     pub(super) active_task_kind: Option<TaskKind>,
     pub(super) task_abort_error: Option<String>,
+    pub(super) pending_core_failure: Option<(usize, String, String)>,
+    pub(super) copilot_core_failure: Option<String>,
     pub(super) notification_worker: Option<NotificationWorker>,
     pub(super) daily_run: Option<DailyRunState>,
     /// 本次 daily 全量运行中完全禁用的任务链名，用于过滤 maa-cli 转发的空跑回调日志。

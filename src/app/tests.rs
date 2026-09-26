@@ -2,7 +2,7 @@ use super::*;
 use crate::copilot::{CopilotEntry, CopilotEntrySource, CopilotOrigin};
 use crate::roguelike::{RoguelikeConfig, RoguelikeField, RoguelikeSection, RoguelikeTheme};
 use std::fs;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -385,6 +385,8 @@ fn daily_progress_uses_config_order_and_total() {
             },
         ],
         total: 1,
+        failed: Vec::new(),
+        completed: false,
     });
 
     app.on_daily_task_started(2, "CloseDown");
@@ -421,6 +423,8 @@ fn daily_progress_matches_label_by_taskchain_when_disabled_in_between() {
             },
         ],
         total: 2,
+        failed: Vec::new(),
+        completed: false,
     });
 
     // taskid=2 对应实际执行的第二个启用任务「公招」，
@@ -454,6 +458,8 @@ fn daily_progress_distinguishes_enabled_tasks_with_same_type() {
             },
         ],
         total: 2,
+        failed: Vec::new(),
+        completed: false,
     });
 
     app.on_daily_task_started(2, "Fight");
@@ -464,6 +470,40 @@ fn daily_progress_distinguishes_enabled_tasks_with_same_type() {
             current: 2,
             total: 2,
             label: "活动关卡".to_string(),
+        })
+    );
+}
+
+#[test]
+fn daily_progress_prefers_enabled_name_for_same_type() {
+    let mut app = App::new();
+    app.daily_run = Some(DailyRunState {
+        tasks: vec![
+            TaskSummary {
+                name: "停用关卡".to_string(),
+                task_type: "Fight".to_string(),
+                enabled: false,
+            },
+            TaskSummary {
+                name: "常驻关卡".to_string(),
+                task_type: "Fight".to_string(),
+                enabled: true,
+            },
+        ],
+        total: 1,
+        failed: Vec::new(),
+        completed: false,
+    });
+
+    // 原配置索引指向已停用实例，但回调 taskid 只统计启用任务：必须取启用项名称。
+    app.on_daily_task_started(1, "Fight");
+    assert_eq!(app.daily_task_label(1, "Fight"), "常驻关卡");
+    assert_eq!(
+        app.run_progress,
+        Some(RunProgress {
+            current: 1,
+            total: 1,
+            label: "常驻关卡".to_string(),
         })
     );
 }
@@ -553,13 +593,14 @@ fn daily_tick_filters_disabled_chain_log_lines() {
         "/bin/sh",
         &[
             "-c",
-            "echo '[x INFO] StartUp Start'; echo '[x INFO] Award Start'",
+            "echo '[2026-09-06 22:00:00 INFO] StartUp Start'; echo '[2026-09-06 22:00:00 INFO] Award Start'",
         ],
     )
     .unwrap();
     app.task = Some(task);
     app.phase = TaskPhase::Running;
     app.active_log_scope = LogScope::Daily;
+    app.active_task_kind = Some(TaskKind::Daily);
     app.disabled_task_chains = vec!["StartUp".to_string()];
 
     // 等待 stdout 日志线程输出，再驱动事件循环。
@@ -571,16 +612,126 @@ fn daily_tick_filters_disabled_chain_log_lines() {
 
     let lines = &app.log_buffer(LogScope::Daily).lines;
     assert!(
-        lines.iter().any(|line| line.text.contains("Award Start")),
+        lines.iter().any(|line| line.text.contains("领取奖励 开始")),
         "启用任务链日志应保留: {lines:?}"
     );
     assert!(
         lines
             .iter()
-            .all(|line| !line.text.ends_with("StartUp Start")),
+            .all(|line| !line.text.contains("启动游戏 开始")
+                && !line.text.ends_with("StartUp Start")),
         "禁用任务链噪音日志应被过滤: {lines:?}"
     );
     app.cleanup();
+}
+
+#[test]
+fn localizes_only_known_active_task_messages() {
+    let mut app = App::new();
+    app.phase = TaskPhase::Running;
+    app.active_task_kind = Some(TaskKind::Copilot);
+    app.active_log_scope = LogScope::Copilot;
+    app.push_log_to(
+        LogScope::Copilot,
+        LogLevel::Info,
+        "[2026-09-06 22:00:00 INFO] BattleFormationSelected 斑点",
+    );
+    app.push_log_to(
+        LogScope::Copilot,
+        LogLevel::Error,
+        "[2026-09-06 22:00:00 ERROR] Fight Error",
+    );
+    app.push_log_to(
+        LogScope::Copilot,
+        LogLevel::Error,
+        "[ERROR] Failed to find Tile-Pos file for T0-1, your resources may be outdated",
+    );
+    app.push_log_to(LogScope::Copilot, LogLevel::Plain, "unknown diagnostic");
+    app.push_log_to(
+        LogScope::Copilot,
+        LogLevel::Info,
+        "[2026-09-06 22:00:00 INFO] BattleFormation 斑点",
+    );
+    app.push_log_to(
+        LogScope::Copilot,
+        LogLevel::Info,
+        "[2026-09-06 22:00:00 INFO] CurrentSteps Deploy 斑点 1-7",
+    );
+    app.push_log_to(
+        LogScope::Copilot,
+        LogLevel::Info,
+        "[2026-09-06 22:00:00 INFO] CurrentSteps SomeUnknownAction x",
+    );
+    app.push_log_to(
+        LogScope::Copilot,
+        LogLevel::Error,
+        "[2026-09-06 22:00:00 ERROR] UnsupportedLevel",
+    );
+    app.push_log_to(LogScope::Update, LogLevel::Info, "Fight Start");
+    let lines = &app.log_buffer(LogScope::Copilot).lines;
+    assert_eq!(lines[0].text, "[2026-09-06 22:00:00 INFO] 已选干员：斑点");
+    assert_eq!(lines[1].text, "[2026-09-06 22:00:00 ERROR] 刷理智 执行失败");
+    assert_eq!(lines[1].level, LogLevel::Error);
+    assert!(lines[2].text.contains("Tile-Pos file for T0-1"));
+    assert!(app.saw_ocr_to_t0_error);
+    assert_eq!(lines[3].text, "unknown diagnostic");
+    assert_eq!(lines[4].text, "[2026-09-06 22:00:00 INFO] 自动编队：斑点");
+    assert_eq!(
+        lines[5].text,
+        "[2026-09-06 22:00:00 INFO] 当前操作：部署 斑点 1-7"
+    );
+    assert_eq!(
+        lines[6].text,
+        "[2026-09-06 22:00:00 INFO] 当前操作：SomeUnknownAction x"
+    );
+    assert_eq!(lines[7].text, "[2026-09-06 22:00:00 ERROR] 不支持的关卡");
+    assert_eq!(
+        app.log_buffer(LogScope::Update).lines[0].text,
+        "Fight Start"
+    );
+}
+
+#[test]
+fn localizes_daily_progress_and_summary_events() {
+    let mut app = App::new();
+    app.phase = TaskPhase::Running;
+    app.active_task_kind = Some(TaskKind::Daily);
+    app.active_log_scope = LogScope::Daily;
+    for message in [
+        "[2026-09-06 22:00:00 INFO] Current sanity: 100",
+        "[2026-09-06 22:00:00 INFO] Drops: 3",
+        "[2026-09-06 22:00:00 INFO] RecruitResult: 5",
+        "[2026-09-06 22:00:00 INFO] EnterFacility Trade",
+        "[2026-09-06 22:00:00 INFO] NotEnoughStaff",
+        "[2026-09-06 22:00:00 INFO] AllTasksCompleted",
+        "[2026-09-06 22:00:00 INFO] Connected",
+        "[2026-09-06 22:00:00 INFO] Mission started",
+        "[2026-09-06 22:00:00 ERROR] FailedToStartGame",
+        "[2026-09-06 22:00:00 ERROR] Some error occurred during running task!",
+    ] {
+        app.push_log_to(LogScope::Daily, LogLevel::Info, message);
+    }
+    let texts: Vec<&str> = app
+        .log_buffer(LogScope::Daily)
+        .lines
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect();
+    assert_eq!(
+        texts,
+        [
+            "[2026-09-06 22:00:00 INFO] 当前理智：100",
+            "[2026-09-06 22:00:00 INFO] 掉落：3",
+            "[2026-09-06 22:00:00 INFO] 招募结果：5",
+            "[2026-09-06 22:00:00 INFO] 进入设施 Trade",
+            "[2026-09-06 22:00:00 INFO] 可用干员不足",
+            "[2026-09-06 22:00:00 INFO] 所有任务已结束",
+            "[2026-09-06 22:00:00 INFO] 已连接",
+            "[2026-09-06 22:00:00 INFO] 作战已开始",
+            "[2026-09-06 22:00:00 ERROR] 启动游戏失败",
+            "[2026-09-06 22:00:00 ERROR] 任务运行过程中发生错误！",
+        ]
+    );
 }
 
 fn test_config_with_disabled_tasks() -> (PathBuf, DailyConfig) {
@@ -1887,4 +2038,543 @@ fn resource_update_success_reports_new_version() {
         None => unsafe { std::env::remove_var("MAA_HOT_UPDATE_DIR") },
     }
     fs::remove_dir_all(root).unwrap();
+}
+
+fn recording_notification_worker(
+    dir: &std::path::Path,
+    record: &std::path::Path,
+) -> NotificationWorker {
+    let script = dir.join("recording-notify.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s|%s\\n' \"$7\" \"$8\" >> {}\n",
+            record.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script, permissions).unwrap();
+    NotificationWorker::new_with_program(script.to_str().unwrap()).unwrap()
+}
+
+fn recorded_notifications(record: &std::path::Path) -> Vec<String> {
+    fs::read_to_string(record)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// 每日任务单项失败：真实 `sh` 进程写出 MaaCore 回调，验证即时告警与部分完成终态。
+#[test]
+fn daily_partial_failure_notifies_and_continues() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("maatui-daily-failure-{unique}"));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("asst.log"), "").unwrap();
+    let record = dir.join("record.txt");
+    let script = dir.join("core.sh");
+    fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+log={log}
+cb() {{ printf '[INF][Px%s][Tx1] Assistant::append_callback | %s %s\n' "$$" "$1" "$2" >> "$log"; }}
+cb TaskChainStart '{{"taskchain":"Fight","taskid":1}}'
+cb SubTaskError '{{"taskchain":"Fight","taskid":1,"subtask":"ProcessTask","details":{{"first":["1-7"]}}}}'
+cb TaskChainError '{{"taskchain":"Fight","taskid":1}}'
+echo '[2026-09-06 22:00:00 INFO] Fight Error'
+sleep 1
+cb TaskChainStart '{{"taskchain":"Award","taskid":2}}'
+cb TaskChainCompleted '{{"taskchain":"Award","taskid":2}}'
+echo '[2026-09-06 22:00:00 INFO] Award Completed'
+cb AllTasksCompleted '{{}}'
+echo '[2026-09-06 22:00:00 INFO] AllTasksCompleted'
+sleep 0.3
+exit 1
+"#,
+            log = dir.join("asst.log").display()
+        ),
+    )
+    .unwrap();
+
+    let mut app = App::new();
+    app.phase = TaskPhase::Running;
+    app.active_task_kind = Some(TaskKind::Daily);
+    app.active_label = "每日任务".to_string();
+    app.active_log_scope = LogScope::Daily;
+    app.disabled_task_chains.clear();
+    app.daily_run = Some(DailyRunState {
+        tasks: vec![
+            TaskSummary {
+                name: "刷理智".to_string(),
+                task_type: "Fight".to_string(),
+                enabled: true,
+            },
+            TaskSummary {
+                name: "领取奖励".to_string(),
+                task_type: "Award".to_string(),
+                enabled: true,
+            },
+        ],
+        total: 2,
+        failed: Vec::new(),
+        completed: false,
+    });
+    app.notification_worker = Some(recording_notification_worker(&dir, &record));
+    app.task = Some(
+        RunningTask::spawn_command_with_core_log_in_dir(
+            "/bin/sh",
+            &["-c", &format!(". {}", script.display())],
+            &dir,
+            true,
+            false,
+        )
+        .unwrap(),
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut early = Vec::new();
+    while std::time::Instant::now() < deadline {
+        app.tick();
+        early = recorded_notifications(&record);
+        if !early.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        app.task.as_ref().is_some_and(|task| !task.is_finished()),
+        "首条失败通知应在前一项失败时立即发出，此时后续任务仍在运行"
+    );
+    assert_eq!(
+        early.first().map(String::as_str),
+        Some("MaaTUI · 每日任务-刷理智-执行失败|关卡导航失败（1-7）"),
+        "early={early:?}"
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    while app.phase != TaskPhase::Idle && std::time::Instant::now() < deadline {
+        app.tick();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(app.phase, TaskPhase::Idle, "任务应在失败后继续并正常收尾");
+    app.notification_worker.as_mut().unwrap().shutdown();
+    let recorded = recorded_notifications(&record);
+    assert_eq!(recorded.len(), 2, "recorded={recorded:?}");
+    assert_eq!(
+        recorded[1],
+        "MaaTUI · 每日任务-已完成 ⚠️部分过程失败|失败项：刷理智"
+    );
+
+    let logs = &app.log_buffer(LogScope::Daily).lines;
+    assert!(
+        logs.iter().any(|line| line.level == LogLevel::Error
+            && line.text == "每日任务 · 刷理智 · 执行失败：关卡导航失败（1-7）"),
+        "logs={logs:?}"
+    );
+    assert!(
+        logs.iter().any(|line| line.level == LogLevel::Warn
+            && line.text == "每日任务已完成，部分过程失败：刷理智"),
+        "logs={logs:?}"
+    );
+    assert!(
+        logs.iter()
+            .any(|line| line.text.ends_with("刷理智 执行失败")),
+        "logs={logs:?}"
+    );
+    assert!(
+        logs.iter().any(|line| line.text.ends_with("领取奖励 完成")),
+        "logs={logs:?}"
+    );
+    assert!(
+        logs.iter()
+            .any(|line| line.text.ends_with("所有任务已结束")),
+        "logs={logs:?}"
+    );
+    assert_eq!(app.status_text, "已完成 · 部分过程失败");
+    assert!(app.last_failed);
+    app.cleanup();
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// 自动战斗编队失败：真实进程回调给出缺失干员，终态原因使用该诊断。
+#[test]
+fn copilot_failure_reports_missing_operators() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("maatui-copilot-failure-{unique}"));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("asst.log"), "").unwrap();
+    let record = dir.join("record.txt");
+    let script = dir.join("core.sh");
+    fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+log={log}
+cb() {{ printf '[INF][Px%s][Tx1] Assistant::append_callback | %s %s\n' "$$" "$1" "$2" >> "$log"; }}
+cb TaskChainStart '{{"taskchain":"Copilot","taskid":1}}'
+cb SubTaskError '{{"taskchain":"Copilot","taskid":1,"why":"OperatorMissing","subtask":"BattleFormationTask","details":{{"opers":{{"A":[{{"name":"予愿安洁莉娜","reason":"Missing"}},{{"name":"斑点","reason":"Unchecked"}}],"B":[{{"name":"安赛尔","reason":"Unavailable"}},{{"name":"芙蓉","reason":"Unavailable"}}]}}}}}}'
+cb SubTaskError '{{"taskchain":"Copilot","taskid":1,"subtask":"ProcessTask","details":{{}}}}'
+cb TaskChainError '{{"taskchain":"Copilot","taskid":1}}'
+exit 1
+"#,
+            log = dir.join("asst.log").display()
+        ),
+    )
+    .unwrap();
+
+    let mut app = App::new();
+    app.phase = TaskPhase::Running;
+    app.active_task_kind = Some(TaskKind::Copilot);
+    app.active_label = "自动战斗".to_string();
+    app.active_log_scope = LogScope::Copilot;
+    app.notification_worker = Some(recording_notification_worker(&dir, &record));
+    app.task = Some(
+        RunningTask::spawn_command_with_core_log_in_dir(
+            "/bin/sh",
+            &["-c", &format!(". {}", script.display())],
+            &dir,
+            false,
+            true,
+        )
+        .unwrap(),
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while app.phase != TaskPhase::Idle && std::time::Instant::now() < deadline {
+        app.tick();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(app.phase, TaskPhase::Idle);
+    app.notification_worker.as_mut().unwrap().shutdown();
+    let recorded = recorded_notifications(&record);
+    assert_eq!(recorded.len(), 1, "recorded={recorded:?}");
+    for name in ["予愿安洁莉娜", "斑点", "安赛尔", "芙蓉", "缺少", "不可用"] {
+        assert!(recorded[0].contains(name), "recorded={recorded:?}");
+    }
+    let logs = &app.log_buffer(LogScope::Copilot).lines;
+    assert!(
+        logs.iter().any(|line| line.level == LogLevel::Error
+            && line.text.starts_with("自动战斗 · 执行失败：")
+            && line.text.contains("予愿安洁莉娜")),
+        "logs={logs:?}"
+    );
+    assert_eq!(app.status_text, "失败 · exit 1");
+    assert!(app.last_failed);
+    app.cleanup();
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// 手动停止与正常收尾：分别不发送终态通知、发送正常完成通知。
+#[test]
+fn daily_stop_and_success_control_final_notifications() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("maatui-daily-final-{unique}"));
+    fs::create_dir_all(&dir).unwrap();
+    let record = dir.join("record.txt");
+
+    let mut app = App::new();
+    app.phase = TaskPhase::Running;
+    app.active_task_kind = Some(TaskKind::Daily);
+    app.active_label = "每日任务".to_string();
+    app.active_log_scope = LogScope::Daily;
+    app.daily_run = Some(DailyRunState {
+        tasks: vec![TaskSummary {
+            name: "刷理智".to_string(),
+            task_type: "Fight".to_string(),
+            enabled: true,
+        }],
+        total: 1,
+        failed: vec![(1, "刷理智".to_string())],
+        completed: true,
+    });
+    app.notification_worker = Some(recording_notification_worker(&dir, &record));
+    app.on_exited(None, true);
+    app.notification_worker.as_mut().unwrap().shutdown();
+    assert!(
+        recorded_notifications(&record).is_empty(),
+        "手动停止不应发送终态通知"
+    );
+    assert_eq!(app.status_text, "已停止 · exit ?");
+    assert!(!app.last_failed);
+
+    let mut app = App::new();
+    app.phase = TaskPhase::Running;
+    app.active_task_kind = Some(TaskKind::Daily);
+    app.active_label = "每日任务".to_string();
+    app.active_log_scope = LogScope::Daily;
+    app.daily_run = Some(DailyRunState {
+        tasks: vec![TaskSummary {
+            name: "刷理智".to_string(),
+            task_type: "Fight".to_string(),
+            enabled: true,
+        }],
+        total: 1,
+        failed: Vec::new(),
+        completed: false,
+    });
+    app.notification_worker = Some(recording_notification_worker(&dir, &record));
+    // 未读到结尾回调也必须按退出码判定成功，不误报失败。
+    app.on_exited(Some(0), false);
+    app.notification_worker.as_mut().unwrap().shutdown();
+    assert_eq!(
+        recorded_notifications(&record),
+        vec!["MaaTUI · 每日任务-已完成|每日任务已正常完成。".to_string()]
+    );
+    assert_eq!(app.status_text, "已完成 · exit 0");
+    assert!(!app.last_failed);
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// 任务链重试线索不得被当成失败：链成功后再无失败记录或通知。
+#[test]
+fn daily_retry_clue_without_chain_error_is_not_a_failure() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("maatui-daily-retry-{unique}"));
+    fs::create_dir_all(&dir).unwrap();
+    let record = dir.join("record.txt");
+
+    let mut app = App::new();
+    app.phase = TaskPhase::Running;
+    app.active_task_kind = Some(TaskKind::Daily);
+    app.active_label = "每日任务".to_string();
+    app.active_log_scope = LogScope::Daily;
+    app.daily_run = Some(DailyRunState {
+        tasks: vec![
+            TaskSummary {
+                name: "刷理智".to_string(),
+                task_type: "Fight".to_string(),
+                enabled: true,
+            },
+            TaskSummary {
+                name: "基建换班".to_string(),
+                task_type: "Infrast".to_string(),
+                enabled: true,
+            },
+        ],
+        total: 2,
+        failed: Vec::new(),
+        completed: false,
+    });
+    app.notification_worker = Some(recording_notification_worker(&dir, &record));
+
+    app.pending_core_failure = Some((3, "Fight".to_string(), "关卡导航失败（1-7）".to_string()));
+    assert_eq!(
+        task_lifecycle::merge_failure_reason(
+            Some("关卡导航失败（1-7）"),
+            "关卡导航失败".to_string()
+        ),
+        "关卡导航失败（1-7）"
+    );
+    assert_eq!(
+        task_lifecycle::merge_failure_reason(None, "关卡导航失败".to_string()),
+        "关卡导航失败"
+    );
+
+    // 链成功会清掉暂存线索，且不产生失败记录或通知。
+    app.clear_pending_core_failure(3, "Fight");
+    assert!(app.pending_core_failure.is_none());
+    app.on_exited(Some(0), false);
+    app.notification_worker.as_mut().unwrap().shutdown();
+
+    assert_eq!(
+        recorded_notifications(&record),
+        vec!["MaaTUI · 每日任务-已完成|每日任务已正常完成。".to_string()]
+    );
+    assert_eq!(app.status_text, "已完成 · exit 0");
+    assert!(!app.last_failed);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// 同一任务链重复失败只提醒一次，并忽略手动停止后的残留错误。
+#[test]
+fn repeated_chain_error_notifies_once_and_manual_stop_ignores_it() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("maatui-daily-repeat-{unique}"));
+    fs::create_dir_all(&dir).unwrap();
+    let record = dir.join("record.txt");
+
+    let mut app = App::new();
+    app.phase = TaskPhase::Running;
+    app.active_task_kind = Some(TaskKind::Daily);
+    app.active_label = "每日任务".to_string();
+    app.active_log_scope = LogScope::Daily;
+    app.daily_run = Some(DailyRunState {
+        tasks: vec![TaskSummary {
+            name: "刷理智".to_string(),
+            task_type: "Fight".to_string(),
+            enabled: true,
+        }],
+        total: 1,
+        failed: Vec::new(),
+        completed: false,
+    });
+    app.notification_worker = Some(recording_notification_worker(&dir, &record));
+
+    app.on_task_chain_failed(1, "Fight", None);
+    app.on_task_chain_failed(1, "Fight", None);
+    app.notification_worker.as_mut().unwrap().shutdown();
+    let recorded = recorded_notifications(&record);
+    assert_eq!(recorded.len(), 1, "recorded={recorded:?}");
+    assert_eq!(
+        recorded[0],
+        "MaaTUI · 每日任务-刷理智-执行失败|任务执行失败"
+    );
+    assert_eq!(app.daily_run.as_ref().unwrap().failed.len(), 1);
+
+    // 已确认失败后手动停止：不发终态通知，也不覆盖为已完成。
+    let mut app = App::new();
+    app.phase = TaskPhase::Running;
+    app.active_task_kind = Some(TaskKind::Daily);
+    app.active_label = "每日任务".to_string();
+    app.active_log_scope = LogScope::Daily;
+    app.daily_run = Some(DailyRunState {
+        tasks: vec![TaskSummary {
+            name: "刷理智".to_string(),
+            task_type: "Fight".to_string(),
+            enabled: true,
+        }],
+        total: 1,
+        failed: vec![(1, "刷理智".to_string())],
+        completed: false,
+    });
+    app.notification_worker = Some(recording_notification_worker(&dir, &record));
+    app.on_exited(None, true);
+    app.notification_worker.as_mut().unwrap().shutdown();
+    assert_eq!(
+        recorded_notifications(&record).len(),
+        1,
+        "手动停止不应追加终态通知"
+    );
+    assert_eq!(app.status_text, "已停止 · exit ?");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// 退出码为 1 但未读到结尾回调：按异常中断处理，不误标部分完成。
+#[test]
+fn daily_failure_without_completion_callback_stays_failed() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("maatui-daily-abort-{unique}"));
+    fs::create_dir_all(&dir).unwrap();
+    let record = dir.join("record.txt");
+
+    let mut app = App::new();
+    app.phase = TaskPhase::Running;
+    app.active_task_kind = Some(TaskKind::Daily);
+    app.active_label = "每日任务".to_string();
+    app.active_log_scope = LogScope::Daily;
+    app.daily_run = Some(DailyRunState {
+        tasks: vec![TaskSummary {
+            name: "刷理智".to_string(),
+            task_type: "Fight".to_string(),
+            enabled: true,
+        }],
+        total: 1,
+        failed: vec![(1, "刷理智".to_string())],
+        completed: false,
+    });
+    app.notification_worker = Some(recording_notification_worker(&dir, &record));
+    app.on_exited(Some(1), false);
+    app.notification_worker.as_mut().unwrap().shutdown();
+
+    let recorded = recorded_notifications(&record);
+    assert_eq!(recorded.len(), 1, "recorded={recorded:?}");
+    assert!(recorded[0].contains("异常中断"), "recorded={recorded:?}");
+    assert_eq!(app.status_text, "失败 · exit 1");
+    assert!(app.last_failed);
+
+    // exit 2 即使读到 AllTasksCompleted 也按异常中断，不标部分完成。
+    let mut app = App::new();
+    app.phase = TaskPhase::Running;
+    app.active_task_kind = Some(TaskKind::Daily);
+    app.active_label = "每日任务".to_string();
+    app.active_log_scope = LogScope::Daily;
+    app.daily_run = Some(DailyRunState {
+        tasks: vec![TaskSummary {
+            name: "刷理智".to_string(),
+            task_type: "Fight".to_string(),
+            enabled: true,
+        }],
+        total: 1,
+        failed: vec![(1, "刷理智".to_string())],
+        completed: true,
+    });
+    app.notification_worker = Some(recording_notification_worker(&dir, &record));
+    app.on_exited(Some(2), false);
+    app.notification_worker.as_mut().unwrap().shutdown();
+    let recorded = recorded_notifications(&record);
+    assert_eq!(recorded.len(), 2, "recorded={recorded:?}");
+    assert!(recorded[1].contains("异常中断"), "recorded={recorded:?}");
+    assert_eq!(app.status_text, "失败 · exit 2");
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// 退出码为 0 但已确认核心失败：自动战斗整体判定失败。
+#[test]
+fn copilot_core_failure_overrides_zero_exit() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("maatui-copilot-core-{unique}"));
+    fs::create_dir_all(&dir).unwrap();
+    let record = dir.join("record.txt");
+
+    let mut app = App::new();
+    app.phase = TaskPhase::Running;
+    app.active_task_kind = Some(TaskKind::Copilot);
+    app.active_label = "自动战斗".to_string();
+    app.active_log_scope = LogScope::Copilot;
+    app.pending_core_failure = Some((
+        1,
+        "Copilot".to_string(),
+        "自动编队失败：缺少 斑点".to_string(),
+    ));
+    app.notification_worker = Some(recording_notification_worker(&dir, &record));
+    app.on_task_chain_failed(1, "Copilot", None);
+    assert_eq!(
+        app.copilot_core_failure.as_deref(),
+        Some("自动编队失败：缺少 斑点")
+    );
+    app.on_exited(Some(0), false);
+    app.notification_worker.as_mut().unwrap().shutdown();
+
+    assert_eq!(app.status_text, "失败 · exit 0");
+    assert!(app.last_failed);
+    let recorded = recorded_notifications(&record);
+    assert_eq!(recorded.len(), 1, "recorded={recorded:?}");
+    assert_eq!(
+        recorded[0],
+        "MaaTUI · 自动战斗异常中断|自动编队失败：缺少 斑点"
+    );
+    assert!(
+        app.log_buffer(LogScope::Copilot)
+            .lines
+            .iter()
+            .any(|line| line.text.contains("自动编队失败：缺少 斑点"))
+    );
+    fs::remove_dir_all(dir).unwrap();
 }

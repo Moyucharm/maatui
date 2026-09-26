@@ -8,6 +8,7 @@ mod process;
 pub use command::{TaskCommand, TaskKind};
 #[allow(unused_imports)]
 pub use log::classify_log_line;
+pub(crate) use log::maa_cli_log_parts;
 pub use process::RunningTask;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,12 +25,42 @@ pub enum LogLevel {
 
 #[derive(Debug, Clone)]
 pub enum RunnerEvent {
-    Line { level: LogLevel, text: String },
-    LogReaderFailed { stream: &'static str, error: String },
-    DailyTaskStarted { task_id: usize, taskchain: String },
+    Line {
+        level: LogLevel,
+        text: String,
+    },
+    LogReaderFailed {
+        stream: &'static str,
+        error: String,
+    },
+    DailyTaskStarted {
+        task_id: usize,
+        taskchain: String,
+    },
+    SubTaskFailure {
+        task_id: usize,
+        taskchain: String,
+        reason: String,
+    },
+    TaskChainFailed {
+        task_id: usize,
+        taskchain: String,
+        error: Option<String>,
+    },
+    TaskChainSucceeded {
+        task_id: usize,
+        taskchain: String,
+    },
+    CopilotTaskStarted {
+        task_id: usize,
+    },
+    DailyTasksCompleted,
     CopilotStageSucceeded,
     ProgressFailed(String),
-    Exited { code: Option<i32>, stopped: bool },
+    Exited {
+        code: Option<i32>,
+        stopped: bool,
+    },
 }
 
 #[cfg(test)]
@@ -141,6 +172,122 @@ mod tests {
     }
 
     #[test]
+    fn core_cursor_distinguishes_failure_from_retry_and_completion() {
+        let dir = temp_dir();
+        let mut cursor = CoreLogCursor::prepare_in_dir(&dir, true, false).unwrap();
+        cursor.pid = 321;
+        let parse = |callback: &str, json: &str| {
+            cursor.parse_progress_line(&format!(
+                "[INF][Px321] Assistant::append_callback | {callback} {json}"
+            ))
+        };
+        assert_eq!(
+            parse(
+                "SubTaskError",
+                r#"{"taskchain":"Fight","taskid":3,"subtask":"ProcessTask","details":{}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            parse(
+                "SubTaskError",
+                r#"{"taskchain":"Fight","taskid":3,"subtask":"ProcessTask","details":{"first":["1-7"]}}"#
+            ),
+            Some(CoreProgressEvent::SubTaskFailure {
+                task_id: 3,
+                taskchain: "Fight".into(),
+                reason: "关卡导航失败（1-7）".into()
+            })
+        );
+        assert_eq!(
+            parse(
+                "SubTaskError",
+                r#"{"taskchain":"Fight","taskid":3,"subtask":"StageNavigationTask","details":{}}"#
+            ),
+            Some(CoreProgressEvent::SubTaskFailure {
+                task_id: 3,
+                taskchain: "Fight".into(),
+                reason: "关卡导航失败".into()
+            })
+        );
+        assert_eq!(
+            parse("TaskChainError", r#"{"taskchain":"Fight","taskid":3}"#),
+            Some(CoreProgressEvent::TaskChainFailed {
+                task_id: 3,
+                taskchain: "Fight".into(),
+                error: None
+            })
+        );
+        assert_eq!(
+            parse("TaskChainStart", r#"{"taskchain":"Infrast","taskid":4}"#),
+            Some(CoreProgressEvent::DailyTaskStarted {
+                task_id: 4,
+                taskchain: "Infrast".into()
+            })
+        );
+        assert_eq!(
+            parse("AllTasksCompleted", "{}"),
+            Some(CoreProgressEvent::DailyTasksCompleted)
+        );
+        assert_eq!(parse("TaskChainError", "{"), None);
+        assert_eq!(
+            cursor
+                .parse_progress_line("[INF][Px999] Assistant::append_callback | TaskChainError {}"),
+            None
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn core_cursor_extracts_operator_missing_names() {
+        let dir = temp_dir();
+        let mut cursor = CoreLogCursor::prepare_in_dir(&dir, false, true).unwrap();
+        cursor.pid = 123;
+        let parse = |callback: &str, json: &str| {
+            cursor.parse_progress_line(&format!(
+                "[INF][Px123] Assistant::append_callback | {callback} {json}"
+            ))
+        };
+        let missing = r#"{"taskchain":"Copilot","taskid":2,"why":"OperatorMissing","subtask":"BattleFormationTask","details":{"opers":{"A":[{"name":"予愿安洁莉娜","reason":"Missing"},{"name":"斑点","reason":"Unchecked"}],"B":[{"name":"安赛尔","reason":"Unavailable"},{"name":"芙蓉","reason":"Unavailable"}]}}}"#;
+        let Some(CoreProgressEvent::SubTaskFailure { reason, .. }) = parse("SubTaskError", missing)
+        else {
+            panic!("expected missing operators")
+        };
+        for name in ["予愿安洁莉娜", "斑点", "安赛尔", "芙蓉", "缺少", "不可用"] {
+            assert!(reason.contains(name), "{reason}");
+        }
+        assert_eq!(
+            parse(
+                "SubTaskError",
+                r#"{"taskchain":"Copilot","taskid":2,"subtask":"ProcessTask","details":{}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            parse(
+                "TaskChainError",
+                r#"{"taskchain":"Copilot","taskid":2,"details":{"error":"core error"}}"#
+            ),
+            Some(CoreProgressEvent::TaskChainFailed {
+                task_id: 2,
+                taskchain: "Copilot".into(),
+                error: Some("core error".into())
+            })
+        );
+        assert_eq!(
+            parse(
+                "TaskChainCompleted",
+                r#"{"taskchain":"Copilot","taskid":2}"#
+            ),
+            Some(CoreProgressEvent::TaskChainSucceeded {
+                task_id: 2,
+                taskchain: "Copilot".into()
+            })
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn core_log_cursor_starts_after_existing_log_content() {
         let dir = temp_dir();
         let path = dir.join("asst.log");
@@ -230,6 +377,11 @@ mod tests {
                     RunnerEvent::Line { level, text } => lines.push((level, text)),
                     RunnerEvent::LogReaderFailed { .. } => {}
                     RunnerEvent::DailyTaskStarted { .. } => {}
+                    RunnerEvent::SubTaskFailure { .. }
+                    | RunnerEvent::TaskChainFailed { .. }
+                    | RunnerEvent::TaskChainSucceeded { .. }
+                    | RunnerEvent::CopilotTaskStarted { .. }
+                    | RunnerEvent::DailyTasksCompleted => {}
                     RunnerEvent::CopilotStageSucceeded => {}
                     RunnerEvent::ProgressFailed(_) => {}
                     RunnerEvent::Exited { code, stopped } => exited = Some((code, stopped)),
@@ -315,6 +467,14 @@ mod tests {
     #[test]
     fn classifies_levels_without_treating_all_stderr_as_warning() {
         assert_eq!(classify_log_line("[ERROR] boom", true).0, LogLevel::Error);
+        assert_eq!(
+            classify_log_line("[2026-09-06 22:00:00 ERROR] Fight Error", true).0,
+            LogLevel::Error
+        );
+        assert_eq!(
+            classify_log_line("[2026-09-06 22:00:00 INFO] Completed", true).0,
+            LogLevel::Info
+        );
         assert_eq!(classify_log_line("[WARN] caution", true).0, LogLevel::Warn);
         assert_eq!(
             classify_log_line("[WARNING] caution", false).0,

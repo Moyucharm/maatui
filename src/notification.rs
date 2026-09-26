@@ -1,9 +1,7 @@
 //! Linux 桌面通知：通过 `notify-send` 汇报目标任务的终态。
 
 use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -16,6 +14,8 @@ use crate::runner::TaskKind;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TaskOutcome<'a> {
     Completed,
+    DailyItemFailed { name: &'a str, detail: &'a str },
+    DailyPartiallyCompleted { failed_names: &'a str },
     Failed(&'a str),
     ManuallyStopped,
 }
@@ -61,24 +61,32 @@ struct NotificationJob {
 }
 
 pub(crate) struct NotificationWorker {
-    jobs: Option<SyncSender<NotificationJob>>,
+    jobs: Option<Sender<NotificationJob>>,
     results: Receiver<NotificationResult>,
     handle: Option<thread::JoinHandle<()>>,
-    stopping: Arc<AtomicBool>,
 }
 
 impl NotificationWorker {
     pub(crate) fn new() -> Result<Self, String> {
-        let (job_tx, job_rx) = mpsc::sync_channel::<NotificationJob>(4);
+        Self::spawn_worker("notify-send")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_program(program: &str) -> Result<Self, String> {
+        Self::spawn_worker(program)
+    }
+
+    fn spawn_worker(program: &str) -> Result<Self, String> {
+        let (job_tx, job_rx) = mpsc::channel::<NotificationJob>();
         let (result_tx, result_rx) = mpsc::channel();
-        let stopping = Arc::new(AtomicBool::new(false));
-        let worker_stopping = Arc::clone(&stopping);
+        let worker_program = program.to_string();
         let handle = thread::Builder::new()
             .name("desktop-notification-worker".to_string())
             .spawn(move || {
+                // 关闭时发送端被丢弃：recv 先排空已入队通知，再返回错误退出。
                 while let Ok(job) = job_rx.recv() {
                     let result = run_notification_command(
-                        "notify-send",
+                        &worker_program,
                         &job.notification.arguments(),
                         SEND_TIMEOUT,
                     );
@@ -91,9 +99,6 @@ impl NotificationWorker {
                     {
                         break;
                     }
-                    if worker_stopping.load(Ordering::Relaxed) {
-                        break;
-                    }
                 }
             })
             .map_err(|error| format!("无法启动桌面通知线程: {error}"))?;
@@ -101,7 +106,6 @@ impl NotificationWorker {
             jobs: Some(job_tx),
             results: result_rx,
             handle: Some(handle),
-            stopping,
         })
     }
 
@@ -115,14 +119,11 @@ impl NotificationWorker {
             .as_ref()
             .ok_or_else(|| "通知线程已关闭".to_string())?;
         sender
-            .try_send(NotificationJob {
+            .send(NotificationJob {
                 scope,
                 notification,
             })
-            .map_err(|error| match error {
-                mpsc::TrySendError::Full(_) => "待处理通知已达到上限".to_string(),
-                mpsc::TrySendError::Disconnected(_) => "通知线程已退出".to_string(),
-            })
+            .map_err(|_| "通知线程已退出".to_string())
     }
 
     pub(crate) fn poll(&self) -> Vec<NotificationResult> {
@@ -134,7 +135,6 @@ impl NotificationWorker {
     }
 
     pub(crate) fn shutdown(&mut self) {
-        self.stopping.store(true, Ordering::Relaxed);
         self.jobs.take();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
@@ -209,6 +209,11 @@ pub(crate) fn for_task(
     }
 
     let (title, body, urgency) = match outcome {
+        TaskOutcome::Completed if kind == TaskKind::Daily => (
+            "MaaTUI · 每日任务-已完成".to_string(),
+            "每日任务已正常完成。".to_string(),
+            Urgency::Normal,
+        ),
         TaskOutcome::Completed => (
             format!("MaaTUI · {label}完成"),
             format!("{label}已正常完成。"),
@@ -220,6 +225,16 @@ pub(crate) fn for_task(
             Urgency::Critical,
         ),
         TaskOutcome::ManuallyStopped => unreachable!("手动停止已提前返回"),
+        TaskOutcome::DailyItemFailed { name, detail } => (
+            format!("MaaTUI · 每日任务-{name}-执行失败"),
+            detail.to_string(),
+            Urgency::Critical,
+        ),
+        TaskOutcome::DailyPartiallyCompleted { failed_names } => (
+            "MaaTUI · 每日任务-已完成 ⚠️部分过程失败".to_string(),
+            format!("失败项：{failed_names}"),
+            Urgency::Critical,
+        ),
     };
     Some(DesktopNotification {
         title,
@@ -231,13 +246,17 @@ pub(crate) fn for_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn daily_completion_builds_normal_notification() {
         let notification = for_task(TaskKind::Daily, "每日任务", TaskOutcome::Completed).unwrap();
 
         assert_eq!(notification.urgency, Urgency::Normal);
-        assert_eq!(notification.title, "MaaTUI · 每日任务完成");
+        assert_eq!(notification.title, "MaaTUI · 每日任务-已完成");
         assert!(notification.body.contains("正常完成"));
         assert_eq!(
             notification.arguments(),
@@ -248,7 +267,7 @@ mod tests {
                 "normal",
                 "--icon",
                 "dialog-information",
-                "MaaTUI · 每日任务完成",
+                "MaaTUI · 每日任务-已完成",
                 "每日任务已正常完成。",
             ]
         );
@@ -314,22 +333,91 @@ mod tests {
     }
 
     #[test]
-    fn worker_reports_results_and_rejects_full_queue() {
-        let mut worker = NotificationWorker::new().unwrap();
-        let notification = for_task(TaskKind::Daily, "每日任务", TaskOutcome::Completed).unwrap();
-        for _ in 0..4 {
-            worker
-                .enqueue(LogScope::Daily, notification.clone())
-                .unwrap();
-        }
-        assert!(
+    fn partial_daily_failure_builds_item_and_partial_notifications() {
+        let item = for_task(
+            TaskKind::Daily,
+            "每日任务",
+            TaskOutcome::DailyItemFailed {
+                name: "领取奖励",
+                detail: "关卡导航失败（1-7）",
+            },
+        )
+        .unwrap();
+        assert_eq!(item.title, "MaaTUI · 每日任务-领取奖励-执行失败");
+        assert_eq!(item.body, "关卡导航失败（1-7）");
+        assert_eq!(item.urgency, Urgency::Critical);
+
+        let partial = for_task(
+            TaskKind::Daily,
+            "每日任务",
+            TaskOutcome::DailyPartiallyCompleted {
+                failed_names: "刷理智、领取奖励",
+            },
+        )
+        .unwrap();
+        assert_eq!(partial.title, "MaaTUI · 每日任务-已完成 ⚠️部分过程失败");
+        assert_eq!(partial.body, "失败项：刷理智、领取奖励");
+        assert_eq!(partial.urgency, Urgency::Critical);
+    }
+
+    #[test]
+    fn worker_drains_all_queued_notifications_in_order() {
+        let dir = temp_dir();
+        let record = dir.join("record.txt");
+        let mut worker = recording_worker(&dir, &record);
+        for index in 0..6 {
             worker
                 .enqueue(
                     LogScope::Daily,
-                    for_task(TaskKind::Daily, "每日任务", TaskOutcome::Completed).unwrap(),
+                    for_task(
+                        TaskKind::Daily,
+                        "每日任务",
+                        TaskOutcome::DailyItemFailed {
+                            name: &format!("任务{index}"),
+                            detail: "原因",
+                        },
+                    )
+                    .unwrap(),
                 )
-                .is_err()
-        );
+                .unwrap();
+        }
         worker.shutdown();
+
+        let recorded = fs::read_to_string(&record).unwrap();
+        let lines: Vec<&str> = recorded.lines().collect();
+        assert_eq!(lines.len(), 6, "recorded={recorded}");
+        for (index, line) in lines.iter().enumerate() {
+            assert_eq!(
+                *line,
+                format!("MaaTUI · 每日任务-任务{index}-执行失败|原因")
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn recording_worker(dir: &Path, record: &Path) -> NotificationWorker {
+        let script = dir.join("recording-notify.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s|%s\\n' \"$7\" \"$8\" >> {}\n",
+                record.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        NotificationWorker::new_with_program(script.to_str().unwrap()).unwrap()
+    }
+
+    fn temp_dir() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("maatui-notify-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }

@@ -530,5 +530,12 @@ mod tests {
             Some(("[2026-09-06 22:00:00 INFO] ", "Completed", LogLevel::Info))
         );
         assert_eq!(maa_cli_log_parts("[2026-09-27 14:16:56 NOTICE] hi"), None);
+        // 填充形式同样不接受非白名单等级；缺尾随空格或空正文按原样切分。
+        assert_eq!(maa_cli_log_parts("[2026-09-27 14:16:56 NOTICE ] hi"), None);
+        assert_eq!(maa_cli_log_parts("[2026-09-27 14:16:56 INFO ]"), None);
+        assert_eq!(
+            maa_cli_log_parts("[2026-09-27 14:16:56 INFO ] "),
+            Some(("[2026-09-27 14:16:56 INFO ] ", "", LogLevel::Info))
+        );
     }
 }

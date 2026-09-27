@@ -647,11 +647,11 @@ fn daily_tick_localizes_padded_maa_logs() {
     app.active_log_scope = LogScope::Daily;
     app.active_task_kind = Some(TaskKind::Daily);
 
-    // 等待 stdout 日志线程输出，再驱动事件循环。
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    for _ in 0..5 {
+    // 轮询等待 stdout 日志线程投递完成，避免固定等待在慢调度下漏行。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while app.log_buffer(LogScope::Daily).lines.len() < 5 && std::time::Instant::now() < deadline {
         app.tick();
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
     let lines = &app.log_buffer(LogScope::Daily).lines;

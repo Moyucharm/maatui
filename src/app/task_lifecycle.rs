@@ -15,6 +15,8 @@ pub(super) fn localize_task_log(text: &str, kind: TaskKind) -> Cow<'_, str> {
     let exact = match message {
         "AllTasksCompleted" => Some("所有任务已结束"),
         "Connected" => Some("已连接"),
+        "Updating hot update files..." => Some("正在更新热更新资源…"),
+        "Hot update completed successfully" => Some("热更新成功"),
         "Mission started" => Some("作战已开始"),
         "EnterFacility" => Some("进入设施"),
         "NotEnoughStaff" => Some("可用干员不足"),

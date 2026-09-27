@@ -68,7 +68,9 @@ pub(crate) fn maa_cli_log_parts(text: &str) -> Option<(&str, &str, LogLevel)> {
         return None;
     }
     let end = text[21..].find("] ")? + 21;
-    let level = match &text[21..end] {
+    // maa-cli 将等级右侧填充到固定宽度（如 "INFO ]"），判定等级时忽略这些填充空格，
+    // 但返回的前缀切片保持原文，避免改动用户可见的时间戳格式。
+    let level = match text[21..end].trim_end_matches(' ') {
         "ERROR" => LogLevel::Error,
         "WARN" => LogLevel::Warn,
         "INFO" => LogLevel::Info,

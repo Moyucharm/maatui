@@ -626,6 +626,82 @@ fn daily_tick_filters_disabled_chain_log_lines() {
 }
 
 #[test]
+fn daily_tick_localizes_padded_maa_logs() {
+    let mut app = App::new();
+    let task = RunningTask::spawn_command(
+        "/bin/sh",
+        &[
+            "-c",
+            "echo '[2026-09-27 14:16:56 INFO ] Updating hot update files...'; \
+             echo '[2026-09-27 14:16:57 INFO ] Hot update completed successfully'; \
+             echo '[2026-09-27 14:16:58 INFO ] Connected'; \
+             echo '[2026-09-27 14:16:59 INFO ] unknown diagnostic payload'; \
+             echo '[2026-09-27 14:17:00 ERROR] Failed to find Tile-Pos file for T0-1, your resources may be outdated'; \
+             sleep 5",
+        ],
+    )
+    .unwrap();
+    app.task = Some(task);
+    app.phase = TaskPhase::Running;
+    app.screen = Screen::Daily;
+    app.active_log_scope = LogScope::Daily;
+    app.active_task_kind = Some(TaskKind::Daily);
+
+    // 等待 stdout 日志线程输出，再驱动事件循环。
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    for _ in 0..5 {
+        app.tick();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let lines = &app.log_buffer(LogScope::Daily).lines;
+    let texts: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
+    assert_eq!(
+        texts,
+        [
+            "[2026-09-27 14:16:56 INFO ] 正在更新热更新资源…",
+            "[2026-09-27 14:16:57 INFO ] 热更新成功",
+            "[2026-09-27 14:16:58 INFO ] 已连接",
+            "[2026-09-27 14:16:59 INFO ] unknown diagnostic payload",
+            "[2026-09-27 14:17:00 ERROR] Failed to find Tile-Pos file for T0-1, your resources may be outdated",
+        ]
+    );
+    assert_eq!(lines[0].level, LogLevel::Info);
+    assert_eq!(lines[2].level, LogLevel::Info);
+    assert_eq!(lines[4].level, LogLevel::Error);
+
+    let backend = ratatui::backend::TestBackend::new(110, 25);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| crate::ui::draw(frame, &mut app))
+        .unwrap();
+    let visible: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    // 宽字符占两列，后一列为填充空格；比较前去除全部空白。
+    let compact: String = visible
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    assert!(compact.contains("正在更新热更新资源…"), "{visible}");
+    assert!(compact.contains("热更新成功"), "{visible}");
+    assert!(compact.contains("已连接"), "{visible}");
+    assert!(compact.contains("unknowndiagnosticpayload"), "{visible}");
+    assert!(compact.contains("Tile-Pos"), "{visible}");
+    assert!(!compact.contains("Updatinghotupdatefiles"), "{visible}");
+    assert!(
+        !compact.contains("Hotupdatecompletedsuccessfully"),
+        "{visible}"
+    );
+    assert!(!compact.contains("Connected"), "{visible}");
+    app.cleanup();
+}
+
+#[test]
 fn localizes_only_known_active_task_messages() {
     let mut app = App::new();
     app.phase = TaskPhase::Running;
@@ -667,6 +743,22 @@ fn localizes_only_known_active_task_messages() {
         LogLevel::Error,
         "[2026-09-06 22:00:00 ERROR] UnsupportedLevel",
     );
+    // maa-cli 填充等级前缀在自动战斗运行中同样要拆出前缀并汉化已知消息。
+    app.push_log_to(
+        LogScope::Copilot,
+        LogLevel::Info,
+        "[2026-09-27 14:16:56 INFO ] BattleFormationSelected 斑点",
+    );
+    app.push_log_to(
+        LogScope::Copilot,
+        LogLevel::Error,
+        "[2026-09-27 14:16:57 ERROR ] Fight Error",
+    );
+    app.push_log_to(
+        LogScope::Copilot,
+        LogLevel::Info,
+        "[2026-09-27 14:16:58 INFO ] BattleFormationSelected Unknown",
+    );
     app.push_log_to(LogScope::Update, LogLevel::Info, "Fight Start");
     let lines = &app.log_buffer(LogScope::Copilot).lines;
     assert_eq!(lines[0].text, "[2026-09-06 22:00:00 INFO] 已选干员：斑点");
@@ -685,6 +777,17 @@ fn localizes_only_known_active_task_messages() {
         "[2026-09-06 22:00:00 INFO] 当前操作：SomeUnknownAction x"
     );
     assert_eq!(lines[7].text, "[2026-09-06 22:00:00 ERROR] 不支持的关卡");
+    assert_eq!(lines[8].text, "[2026-09-27 14:16:56 INFO ] 已选干员：斑点");
+    assert_eq!(lines[8].level, LogLevel::Info);
+    assert_eq!(
+        lines[9].text,
+        "[2026-09-27 14:16:57 ERROR ] 刷理智 执行失败"
+    );
+    assert_eq!(lines[9].level, LogLevel::Error);
+    assert_eq!(
+        lines[10].text,
+        "[2026-09-27 14:16:58 INFO ] 已选干员：Unknown"
+    );
     assert_eq!(
         app.log_buffer(LogScope::Update).lines[0].text,
         "Fight Start"
@@ -708,6 +811,10 @@ fn localizes_daily_progress_and_summary_events() {
         "[2026-09-06 22:00:00 INFO] Mission started",
         "[2026-09-06 22:00:00 ERROR] FailedToStartGame",
         "[2026-09-06 22:00:00 ERROR] Some error occurred during running task!",
+        // 截图中的 maa-cli 填充前缀格式与热更新回调正文。
+        "[2026-09-27 14:16:56 INFO ] Updating hot update files...",
+        "[2026-09-27 14:16:57 INFO ] Hot update completed successfully",
+        "[2026-09-27 14:16:58 INFO ] Connected",
     ] {
         app.push_log_to(LogScope::Daily, LogLevel::Info, message);
     }
@@ -730,6 +837,9 @@ fn localizes_daily_progress_and_summary_events() {
             "[2026-09-06 22:00:00 INFO] 作战已开始",
             "[2026-09-06 22:00:00 ERROR] 启动游戏失败",
             "[2026-09-06 22:00:00 ERROR] 任务运行过程中发生错误！",
+            "[2026-09-27 14:16:56 INFO ] 正在更新热更新资源…",
+            "[2026-09-27 14:16:57 INFO ] 热更新成功",
+            "[2026-09-27 14:16:58 INFO ] 已连接",
         ]
     );
 }

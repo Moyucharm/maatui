@@ -512,5 +512,23 @@ mod tests {
             classify_log_line("ordinary stderr", true).0,
             LogLevel::Plain
         );
+        // maa-cli 会把等级右侧填充到固定宽度（"INFO ]"），需按等级识别并保留原始前缀。
+        assert_eq!(
+            classify_log_line("[2026-09-27 14:16:56 INFO ] Connected", true).0,
+            LogLevel::Info
+        );
+        assert_eq!(
+            classify_log_line("[2026-09-27 14:16:56 ERROR ] boom", true).0,
+            LogLevel::Error
+        );
+        assert_eq!(
+            maa_cli_log_parts("[2026-09-27 14:16:56 INFO ] Connected"),
+            Some(("[2026-09-27 14:16:56 INFO ] ", "Connected", LogLevel::Info))
+        );
+        assert_eq!(
+            maa_cli_log_parts("[2026-09-06 22:00:00 INFO] Completed"),
+            Some(("[2026-09-06 22:00:00 INFO] ", "Completed", LogLevel::Info))
+        );
+        assert_eq!(maa_cli_log_parts("[2026-09-27 14:16:56 NOTICE] hi"), None);
     }
 }

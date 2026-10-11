@@ -14,6 +14,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKi
 use crate::config::TaskSummary;
 use crate::config::{DailyConfig, FieldValue};
 use crate::config_save;
+use crate::connection::{ConnectionConfig, ConnectionField};
 use crate::copilot::{
     BatchTask, CopilotCache, CopilotDetail, CopilotRunOptions, ImportKind, ImportReport,
     import_source, remove_batch_task, write_batch_task,
@@ -41,6 +42,7 @@ pub const TASK_TYPES: [&str; 8] = [
     "Copilot",
 ];
 
+mod connection;
 mod copilot;
 mod daily;
 mod input;
@@ -75,6 +77,10 @@ impl App {
         let (config, config_error) = match DailyConfig::load_default() {
             Ok(config) => (Some(config), None),
             Err(error) => (None, Some(error.to_string())),
+        };
+        let (connection_config, connection_error) = match ConnectionConfig::load_default() {
+            Ok(config) => (Some(config), None),
+            Err(error) => (None, Some(format!("{error:#}"))),
         };
         let (copilot_cache, copilot_error) = match CopilotCache::load_default() {
             Ok(cache) => (Some(cache), None),
@@ -120,6 +126,7 @@ impl App {
             roguelike_advanced_idx: 0,
             roguelike_section_idx: 0,
             update_idx: 0,
+            connection_idx: 0,
             phase: TaskPhase::Idle,
             menu_logs: MenuLogs::default(),
             active_log_scope: LogScope::Daily,
@@ -130,6 +137,8 @@ impl App {
             last_failed: false,
             config,
             config_error,
+            connection_config,
+            connection_error,
             config_save_worker: if cfg!(test) {
                 None
             } else {
@@ -289,7 +298,7 @@ impl App {
             Screen::Copilot => LogScope::Copilot,
             Screen::Roguelike => LogScope::Roguelike,
             Screen::Update => LogScope::Update,
-            Screen::Main => self.active_log_scope,
+            Screen::Main | Screen::Connection => self.active_log_scope,
         }
     }
 

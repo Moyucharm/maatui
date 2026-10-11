@@ -168,6 +168,13 @@ impl App {
             InputTarget::CopilotAdd { .. } | InputTarget::CopilotText(_) => {
                 anyhow::bail!("该字段不支持选项选择")
             }
+            InputTarget::ConnectionField(field) => {
+                let FieldValue::String(input) = value else {
+                    anyhow::bail!("连接配置选项必须是文本")
+                };
+                self.commit_connection_input(field, &input);
+                Ok(())
+            }
             InputTarget::RoguelikeField(field) => self.set_roguelike_field_result(field, value),
         }
     }
@@ -363,6 +370,10 @@ impl App {
                 Ok(())
             }
             InputTarget::RoguelikeField(field) => self.commit_roguelike_input(field, &dialog.value),
+            InputTarget::ConnectionField(field) => {
+                self.commit_connection_input(field, &dialog.value);
+                Ok(())
+            }
         };
         if let Err(error) = result {
             self.status_error(error.to_string());

@@ -3,6 +3,7 @@
 mod app;
 mod config;
 mod config_save;
+mod connection;
 mod copilot;
 mod copilot_run;
 mod http;

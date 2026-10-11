@@ -273,12 +273,15 @@ pub(super) fn shortcut_help_title(app: &App) -> String {
         Screen::Copilot => format!("自动战斗 · {}", app.copilot_section().label()),
         Screen::Roguelike => format!("自动肉鸽 · {}", app.roguelike_section().label()),
         Screen::Update => "更新管理".to_string(),
+        Screen::Connection => "连接配置".to_string(),
     }
 }
 
 pub(super) fn input_dialog_hint(input: &InputDialog) -> &'static str {
     if input.allows_import_kind_switch() {
         "  Enter 确认 · Esc 取消 · Ctrl+U 清空 · ← 作业集 · → 单个作业"
+    } else if matches!(input.target, crate::app::InputTarget::ConnectionField(_)) {
+        "  Enter 保存 · Esc 取消 · Ctrl+U 清空恢复默认"
     } else {
         "  Enter 确认 · Esc 取消 · Ctrl+U 清空"
     }

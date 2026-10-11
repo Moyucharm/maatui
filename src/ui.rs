@@ -19,6 +19,7 @@ use crate::runner::LogLevel;
 use crate::shortcuts::{ShortcutHint, hints as shortcut_hints_for};
 
 mod chrome;
+mod connection;
 mod copilot;
 mod daily;
 mod modals;
@@ -27,6 +28,7 @@ mod text;
 mod update;
 
 use chrome::{draw_footer, draw_logs, draw_running_control};
+use connection::draw_connection;
 use copilot::draw_copilot;
 use daily::{
     draw_add_task, draw_config, draw_daily, draw_task_edit, draw_variant_edit, draw_variant_list,
@@ -186,6 +188,7 @@ fn draw_screen(frame: &mut Frame, app: &App, area: Rect) {
         Screen::Copilot => draw_copilot(frame, app, area),
         Screen::Roguelike => draw_roguelike(frame, app, area),
         Screen::Update => draw_update(frame, app, area),
+        Screen::Connection => draw_connection(frame, app, area),
     }
 }
 

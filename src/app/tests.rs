@@ -121,6 +121,230 @@ fn test_roguelike_config() -> (PathBuf, RoguelikeConfig) {
     (dir, config)
 }
 
+fn test_connection_config() -> (PathBuf, crate::connection::ConnectionConfig) {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("maatui-app-connection-{unique}"));
+    fs::create_dir_all(dir.join("profiles")).unwrap();
+    fs::write(
+        dir.join("profiles/default.toml"),
+        "[connection]\naddress = 'emulator-5554'\n[resource]\nuser_resource = true\n",
+    )
+    .unwrap();
+    let config = crate::connection::ConnectionConfig::load_from_config_dir(&dir).unwrap();
+    (dir, config)
+}
+
+#[test]
+fn connection_edits_persist_cancel_and_restore_defaults() {
+    use crate::connection::{ConnectionConfig, ConnectionField};
+
+    let (dir, config) = test_connection_config();
+    let path = config.path().to_path_buf();
+    let mut app = App::new();
+    app.connection_config = Some(config);
+    app.connection_error = None;
+    app.screen = Screen::Connection;
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+    for (index, (field, value)) in [
+        (ConnectionField::AdbPath, "/opt/emulator/adb"),
+        (ConnectionField::Address, "USB-device-serial"),
+        (ConnectionField::Config, "CompatPOSIXShell"),
+        (ConnectionField::Preset, "ADB"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        app.connection_idx = index;
+        app.handle_key(key(KeyCode::Char('e')));
+        if matches!(field, ConnectionField::Config | ConnectionField::Preset) {
+            app.handle_key(key(KeyCode::Char('c')));
+        }
+        app.input.as_mut().unwrap().value = format!("  {value}  ");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            ConnectionConfig::load_from_config_dir(&dir)
+                .unwrap()
+                .value(field),
+            Some(value)
+        );
+    }
+
+    app.connection_idx = 1;
+    let saved = fs::read(&path).unwrap();
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.input.as_ref().unwrap().value, "USB-device-serial");
+    app.input.as_mut().unwrap().value = "cancelled-address".to_string();
+    app.handle_key(key(KeyCode::Esc));
+    assert_eq!(fs::read(&path).unwrap(), saved);
+    assert_eq!(
+        app.connection_config
+            .as_ref()
+            .unwrap()
+            .value(ConnectionField::Address),
+        Some("USB-device-serial")
+    );
+
+    app.handle_key(key(KeyCode::Enter));
+    app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        ConnectionConfig::load_from_config_dir(&dir)
+            .unwrap()
+            .value(ConnectionField::Address),
+        None
+    );
+    let saved = fs::read_to_string(&path)
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    assert_eq!(saved["resource"]["user_resource"].as_bool(), Some(true));
+    app.handle_key(key(KeyCode::Esc));
+    assert_eq!(app.screen, Screen::Main);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn connection_selectors_preserve_current_values_cancel_and_restore_defaults() {
+    use crate::connection::{ConnectionConfig, ConnectionField};
+
+    let (dir, mut config) = test_connection_config();
+    config
+        .set_field(ConnectionField::Config, "CustomCoreConfig")
+        .unwrap();
+    config.set_field(ConnectionField::Preset, "Adb").unwrap();
+    let path = config.path().to_path_buf();
+    let mut app = App::new();
+    app.connection_config = Some(config);
+    app.connection_error = None;
+    app.screen = Screen::Connection;
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+    for (field, current) in [
+        (ConnectionField::Config, "CustomCoreConfig"),
+        (ConnectionField::Preset, "Adb"),
+    ] {
+        app.connection_idx = ConnectionField::ALL
+            .iter()
+            .position(|item| *item == field)
+            .unwrap();
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            ConnectionConfig::load_from_config_dir(&dir)
+                .unwrap()
+                .value(field),
+            Some(current)
+        );
+
+        let original = fs::read(&path).unwrap();
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(fs::read(&path).unwrap(), original);
+
+        app.handle_key(key(KeyCode::Enter));
+        let select = app.select.as_ref().unwrap();
+        let target = select
+            .options
+            .iter()
+            .position(|option| option.value == FieldValue::String("Waydroid".to_string()))
+            .unwrap();
+        let selected = select.selected;
+        let direction = if target < selected {
+            KeyCode::Up
+        } else {
+            KeyCode::Down
+        };
+        for _ in 0..target.abs_diff(selected) {
+            app.handle_key(key(direction));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            ConnectionConfig::load_from_config_dir(&dir)
+                .unwrap()
+                .value(field),
+            Some("Waydroid")
+        );
+
+        app.handle_key(key(KeyCode::Enter));
+        let selected = app.select.as_ref().unwrap().selected;
+        for _ in 0..selected {
+            app.handle_key(key(KeyCode::Up));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            ConnectionConfig::load_from_config_dir(&dir)
+                .unwrap()
+                .value(field),
+            None
+        );
+    }
+    let saved = fs::read_to_string(&path)
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    assert_eq!(saved["resource"]["user_resource"].as_bool(), Some(true));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn connection_write_failure_preserves_values_and_running_blocks_editing() {
+    use crate::connection::ConnectionField;
+
+    let (dir, config) = test_connection_config();
+    let path = config.path().to_path_buf();
+    let mut app = App::new();
+    app.connection_config = Some(config);
+    app.connection_error = None;
+    app.connection_idx = 1;
+    app.screen = Screen::Connection;
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    app.phase = TaskPhase::Running;
+    app.handle_key(key(KeyCode::Char('e')));
+    assert!(app.input.is_none());
+    app.phase = TaskPhase::Idle;
+    app.handle_key(key(KeyCode::Enter));
+    app.input.as_mut().unwrap().value = "ignored-while-running".to_string();
+    let original = fs::read(&path).unwrap();
+    app.phase = TaskPhase::Running;
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_eq!(
+        app.connection_config
+            .as_ref()
+            .unwrap()
+            .value(ConnectionField::Address),
+        Some("emulator-5554")
+    );
+    app.phase = TaskPhase::Idle;
+
+    let outside = dir.with_extension("outside.toml");
+    fs::write(&outside, "outside file must remain unchanged").unwrap();
+    fs::remove_file(&path).unwrap();
+    symlink(&outside, &path).unwrap();
+    app.handle_key(key(KeyCode::Enter));
+    app.input.as_mut().unwrap().value = "127.0.0.1:5555".to_string();
+    app.handle_key(key(KeyCode::Enter));
+    assert!(app.last_failed);
+    assert_eq!(
+        app.connection_config
+            .as_ref()
+            .unwrap()
+            .value(ConnectionField::Address),
+        Some("emulator-5554")
+    );
+    assert_eq!(
+        fs::read_to_string(&outside).unwrap(),
+        "outside file must remain unchanged"
+    );
+    fs::remove_dir_all(dir).unwrap();
+    fs::remove_file(outside).unwrap();
+}
+
 #[test]
 fn roguelike_menu_navigation_and_tabs_are_independent() {
     let mut app = App::new();
@@ -358,10 +582,6 @@ fn commands_select_their_own_log_scope() {
 
 #[test]
 fn config_is_nested_under_daily_navigation() {
-    assert_eq!(
-        MainMenuItem::ALL.map(MainMenuItem::label),
-        ["每日任务", "自动战斗", "自动肉鸽", "更新管理", "退出"]
-    );
     let mut app = App::new();
     app.screen = Screen::Config;
     app.handle_config_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));

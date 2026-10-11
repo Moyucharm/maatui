@@ -65,6 +65,7 @@ impl App {
             Screen::Copilot => self.handle_copilot_key(key),
             Screen::Roguelike => self.handle_roguelike_key(key),
             Screen::Update => self.handle_update_key(key),
+            Screen::Connection => self.handle_connection_key(key),
         }
     }
 
@@ -144,6 +145,11 @@ impl App {
                 MainMenuItem::Update => {
                     self.update_idx = 0;
                     self.screen = Screen::Update;
+                }
+                MainMenuItem::Connection => {
+                    self.connection_idx = 0;
+                    self.reload_connection();
+                    self.screen = Screen::Connection;
                 }
                 MainMenuItem::Quit => self.request_quit(),
             },

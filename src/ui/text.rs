@@ -116,6 +116,7 @@ pub(super) fn form_content_height(app: &App, total_height: u16) -> u16 {
         },
         Screen::Daily => 2,
         Screen::Main => MainMenuItem::ALL.len() as u16,
+        Screen::Connection => crate::connection::ConnectionField::ALL.len() as u16,
         Screen::AddTask => TASK_TYPES.len() as u16,
         Screen::Config => app
             .config

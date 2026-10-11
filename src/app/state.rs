@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use crate::config::{DailyConfig, FieldValue, TaskSummary};
 use crate::config_save::ConfigSaveWorker;
+use crate::connection::{ConnectionConfig, ConnectionField};
 use crate::copilot::{
     CopilotCache, CopilotOperatorDetail, CopilotOperatorGroup, CopilotOptions,
     CopilotSkillActionDetail, ImportKind, ImportProgress, ImportReport,
@@ -40,15 +41,17 @@ pub enum MainMenuItem {
     Copilot,
     Roguelike,
     Update,
+    Connection,
     Quit,
 }
 
 impl MainMenuItem {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Daily,
         Self::Copilot,
         Self::Roguelike,
         Self::Update,
+        Self::Connection,
         Self::Quit,
     ];
 
@@ -58,6 +61,7 @@ impl MainMenuItem {
             Self::Copilot => "自动战斗",
             Self::Roguelike => "自动肉鸽",
             Self::Update => "更新管理",
+            Self::Connection => "连接配置",
             Self::Quit => "退出",
         }
     }
@@ -68,6 +72,7 @@ impl MainMenuItem {
             Self::Copilot => "单作业 / 作业集（批量）",
             Self::Roguelike => "控制面板 / 高级设置",
             Self::Update => "手动更新资源或 Core",
+            Self::Connection => "编辑 maa-cli 默认连接档案",
             Self::Quit => "安全退出 MaaTUI",
         }
     }
@@ -85,6 +90,7 @@ pub enum Screen {
     Copilot,
     Roguelike,
     Update,
+    Connection,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,6 +298,7 @@ pub enum InputTarget {
     CopilotNumber(CopilotNumberField),
     CopilotText(CopilotTextField),
     RoguelikeField(RoguelikeField),
+    ConnectionField(ConnectionField),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -433,6 +440,7 @@ pub struct App {
     pub roguelike_advanced_idx: usize,
     pub roguelike_section_idx: usize,
     pub update_idx: usize,
+    pub connection_idx: usize,
     pub phase: TaskPhase,
     pub menu_logs: MenuLogs,
     pub active_log_scope: LogScope,
@@ -443,6 +451,8 @@ pub struct App {
     pub last_failed: bool,
     pub config: Option<DailyConfig>,
     pub config_error: Option<String>,
+    pub connection_config: Option<ConnectionConfig>,
+    pub connection_error: Option<String>,
     pub(super) config_save_worker: Option<ConfigSaveWorker>,
     pub(super) config_revision: u64,
     pub(super) config_dirty: bool,

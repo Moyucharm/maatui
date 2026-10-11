@@ -22,6 +22,7 @@ pub enum ShortcutContext {
     RoguelikeControl,
     RoguelikeAdvanced,
     Update,
+    Connection,
 }
 
 impl ShortcutContext {
@@ -54,6 +55,7 @@ impl ShortcutContext {
                 RoguelikeSection::Advanced => Self::RoguelikeAdvanced,
             },
             Screen::Update => Self::Update,
+            Screen::Connection => Self::Connection,
         }
     }
 }
@@ -578,6 +580,27 @@ const UPDATE: &[ActionSpec] = &[
     ),
     shown(Action::Back, "导航", "Esc/q", "返回", "返回主菜单", 3),
 ];
+const CONNECTION: &[ActionSpec] = &[
+    shown(Action::Previous, "导航", "↑↓/jk", "选择", "选择连接字段", 0),
+    hidden(Action::Next),
+    shown(
+        Action::Edit,
+        "编辑",
+        "Enter/e",
+        "编辑",
+        "编辑当前字段；清空恢复默认",
+        1,
+    ),
+    shown(
+        Action::Reload,
+        "编辑",
+        "r",
+        "重载",
+        "重新读取默认连接档案",
+        2,
+    ),
+    shown(Action::Back, "导航", "Esc/q", "返回", "返回主菜单", 3),
+];
 
 fn specs(context: ShortcutContext) -> &'static [ActionSpec] {
     match context {
@@ -596,6 +619,7 @@ fn specs(context: ShortcutContext) -> &'static [ActionSpec] {
         ShortcutContext::RoguelikeControl => ROGUELIKE_CONTROL,
         ShortcutContext::RoguelikeAdvanced => ROGUELIKE_ADVANCED,
         ShortcutContext::Update => UPDATE,
+        ShortcutContext::Connection => CONNECTION,
     }
 }
 
@@ -691,6 +715,7 @@ mod tests {
             ShortcutContext::RoguelikeControl,
             ShortcutContext::RoguelikeAdvanced,
             ShortcutContext::Update,
+            ShortcutContext::Connection,
         ] {
             let shown = specs(context).iter().filter_map(|spec| {
                 spec.hint

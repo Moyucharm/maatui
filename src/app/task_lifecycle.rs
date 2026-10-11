@@ -8,18 +8,67 @@ use std::borrow::Cow;
 pub(super) fn localize_task_log(text: &str, kind: TaskKind) -> Cow<'_, str> {
     let (prefix, message) = crate::runner::maa_cli_log_parts(text)
         .map_or(("", text), |(prefix, message, _)| (prefix, message));
-    if message.to_ascii_lowercase().contains("tile-pos") {
+    if message
+        .as_bytes()
+        .windows(b"tile-pos".len())
+        .any(|window| window.eq_ignore_ascii_case(b"tile-pos"))
+    {
         return Cow::Borrowed(text);
     }
 
     let exact = match message {
         "AllTasksCompleted" => Some("所有任务已结束"),
         "Connected" => Some("已连接"),
+        "InitializationError" => Some("初始化失败"),
+        "Disconnected" => Some("连接已断开"),
+        "ReconnectSuccess" => Some("重连成功"),
+        "TouchModeNotAvailable" => Some("触控模式不可用"),
         "Updating hot update files..." => Some("正在更新热更新资源…"),
         "Hot update completed successfully" => Some("热更新成功"),
         "Mission started" => Some("作战已开始"),
         "EnterFacility" => Some("进入设施"),
         "NotEnoughStaff" => Some("可用干员不足"),
+        "PRTS error" => Some("代理指挥出错"),
+        "Refresh Tags" => Some("刷新招募标签"),
+        "Recruit" => Some("开始招募"),
+        "InfrastDormDoubleConfirmed" => Some("已确认宿舍换班提示"),
+        "ProductIncorrect" => Some("设施产物不符"),
+        "ProductUnknown" => Some("无法识别设施产物"),
+        "ProductChanged" => Some("已切换设施产物"),
+        "TheEX" => Some("EX 关卡不支持代理刷理智"),
+        "GameOffline" => Some("游戏已掉线"),
+        "Auto reconnect disabled, stopping" => Some("自动重连已禁用，正在停止"),
+        "Exploration Abandoned" => Some("已放弃探索"),
+        "ExplorationConfirmed" => Some("已确认探索结束"),
+        "MissionCompleted" => Some("作战胜利"),
+        "MissionFailed" => Some("作战失败"),
+        "MissionStart" => Some("作战已开始"),
+        "StageTraderEnter" => Some("进入诡意行商"),
+        "StageSafeHouseEnter" => Some("进入安全屋"),
+        "StageCombatOpsEnter" => Some("进入普通作战"),
+        "EmergencyOpsEnter" => Some("进入紧急作战"),
+        "DreadfulFoe" => Some("进入险路恶敌"),
+        "TraderInvestSystemFull" => Some("投资系统已满"),
+        "RoguelikeGamePass" => Some("肉鸽探索通关"),
+        "RoguelikeSpecialItemBought" => Some("已购买肉鸽特殊商品"),
+        "Instance destroyed" => Some("实例已销毁"),
+        "Starting MAA..." => Some("正在启动 MAA…"),
+        "Stopping MAA..." => Some("正在停止 MAA…"),
+        "Closing external app..." => Some("正在关闭外部程序…"),
+        "MaaCore already loaded" => Some("MaaCore 已加载"),
+        "MaaCore not found, trying to load from system library path" => {
+            Some("未找到 MaaCore，尝试从系统库路径加载")
+        }
+        "Fetching resource repository..." => Some("正在拉取资源仓库…"),
+        "Cloning resource repository..." => Some("正在克隆资源仓库…"),
+        "Fast-forwarding" => Some("正在快进更新"),
+        "Already up-to-date" => Some("已是最新版本"),
+        "Failed to execute git, falling back to libgit2 backend" => {
+            Some("无法执行 git，改用 libgit2 后端")
+        }
+        "Summary" | "Summary:" => Some("任务总结："),
+        "Explorations:" => Some("探索记录："),
+        "Detected tags:" => Some("识别到的招募标签："),
         "FailedToStartGame" => Some("启动游戏失败"),
         "FailedToRecognizeDrops" => Some("识别掉落失败"),
         "StageInfoError" => Some("关卡信息错误"),
@@ -48,15 +97,125 @@ pub(super) fn localize_task_log(text: &str, kind: TaskKind) -> Cow<'_, str> {
             }
         }
     }
+    // 带数字的模板只接受完整格式，避免改写相似的诊断文本。
+    let number = |value: &str| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit());
+    if let Some(rest) = message
+        .strip_prefix("Mission started (")
+        .and_then(|rest| rest.strip_suffix(" sanity)"))
+        && let Some((times, sanity)) = rest.split_once(" times, use ")
+        && number(times)
+        && number(sanity)
+    {
+        return Cow::Owned(format!(
+            "{prefix}作战已开始（连战 {times} 次，消耗 {sanity} 理智）"
+        ));
+    }
+    for (source, suffix, before, after) in [
+        ("Use ", " expiring medicine", "使用 ", " 瓶即将过期的理智药"),
+        ("Use ", " medicine", "使用 ", " 瓶理智药"),
+        ("Use ", " stones", "使用 ", " 颗源石"),
+        ("Reconnect ", " times", "正在进行第 ", " 次重连"),
+        ("Start exploration ", " times", "开始第 ", " 次探索"),
+        (
+            "Gain ",
+            " exp during this exploration",
+            "本次探索获得 ",
+            " 经验",
+        ),
+        ("RecruitTagsRefreshed: ", " times", "已刷新招募标签 ", " 次"),
+        ("Recruited ", " times", "已招募 ", " 次"),
+        ("Refreshed ", " times", "已刷新 ", " 次"),
+        (
+            "Total invest ",
+            " originium ingotes",
+            "累计投资 ",
+            " 源石锭",
+        ),
+        ("Total gained ", " exp", "累计获得 ", " 经验"),
+    ] {
+        if let Some(value) = message
+            .strip_prefix(source)
+            .and_then(|rest| rest.strip_suffix(suffix))
+            && number(value)
+        {
+            return Cow::Owned(format!("{prefix}{before}{value}{after}"));
+        }
+    }
+    if let Some(rest) = message
+        .strip_prefix("Deposit ")
+        .and_then(|rest| rest.strip_suffix(" originium ingots"))
+        && let Some((count, rest)) = rest.split_once(" / ")
+        && let Some((total, deposit)) = rest.split_once(" / ")
+        && number(count)
+        && number(total)
+        && number(deposit)
+    {
+        return Cow::Owned(format!(
+            "{prefix}投资源石锭：本次 {count} / 累计 {total} / 存款 {deposit}"
+        ));
+    }
+    if let Some(rest) = message.strip_prefix("EnterFacility ") {
+        let (facility, rest) = rest.split_once(' ').unwrap_or((rest, ""));
+        let label = schema::facility_label(facility);
+        return Cow::Owned(if rest.is_empty() {
+            format!("{prefix}进入设施 {label}")
+        } else {
+            format!("{prefix}进入设施 {label} {rest}")
+        });
+    }
+    if let Some(rest) = message.strip_prefix("Failed to connect to android device, ")
+        && let Some((reason, details)) =
+            rest.split_once(", Please check your connect configuration: ")
+    {
+        return Cow::Owned(format!(
+            "{prefix}连接安卓设备失败：{reason}，请检查连接配置：{details}"
+        ));
+    }
+    if let Some(rest) = message.strip_prefix("Adding task [")
+        && let Some((task, params)) = rest.split_once("] with params: ")
+    {
+        let label = task_type_label(task);
+        return Cow::Owned(format!("{prefix}添加任务 [{label}]，参数：{params}"));
+    }
+    if let Some(reason) = message.strip_suffix(" HasReturned") {
+        return Cow::Owned(format!("{prefix}自动招募出错并已返回：{reason}"));
+    }
     for (source, target) in [
         ("Current sanity:", "当前理智："),
         ("Drops:", "掉落："),
         ("RecruitResult:", "招募结果："),
-        ("EnterFacility ", "进入设施 "),
+        ("RecruitingTips:", "招募提示："),
+        ("RecruitTagsSelected:", "已选择招募标签："),
+        ("ProductOfFacility:", "设施产物："),
+        ("CustomInfrastRoomOperators:", "自定义设施干员："),
+        ("FailedToReportToPenguinStats, ", "上传企鹅物流失败："),
+        ("StartCombat ", "开始作战："),
         ("NotEnoughStaff ", "可用干员不足 "),
+        ("Got UUID: ", "设备 UUID："),
+        ("Got Resolution: ", "设备分辨率："),
+        ("FastestWayToScreencap ", "最快截图方式："),
+        ("ScreencapCost ", "截图耗时："),
+        (
+            "Failed to connect to android device, ",
+            "连接安卓设备失败：",
+        ),
+        ("Setting client type to ", "设置客户端类型："),
+        ("Loading MaaCore from: ", "加载 MaaCore："),
+        ("Setting user directory: ", "设置用户目录："),
+        (
+            "Failed to update resource repository: ",
+            "更新资源仓库失败：",
+        ),
     ] {
         if let Some(rest) = message.strip_prefix(source) {
-            return Cow::Owned(format!("{prefix}{target}{}", rest.trim_start()));
+            let rest = rest.trim_start();
+            let rest =
+                if matches!(source, "Drops:" | "CustomInfrastRoomOperators:") && rest == "none" {
+                    "无"
+                } else {
+                    rest
+                };
+            return Cow::Owned(format!("{prefix}{target}{rest}"));
         }
     }
     if kind == TaskKind::Copilot {
@@ -76,6 +235,10 @@ pub(super) fn localize_task_log(text: &str, kind: TaskKind) -> Cow<'_, str> {
                 "UseSkill" => "使用技能",
                 "Retreat" => "撤退",
                 "SwitchSpeed" => "切换速度",
+                "SpeedUp" => "切换速度",
+                "BulletTime" => "切换子弹时间",
+                "SkillDaemon" => "自动使用技能",
+                "Output" => "输出信息",
                 _ => action,
             };
             return Cow::Owned(format!("{prefix}当前操作：{action} {target}"));

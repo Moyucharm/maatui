@@ -324,12 +324,10 @@ impl App {
         }
         let text = if scope == self.active_log_scope && self.phase != TaskPhase::Idle {
             match self.active_task_kind {
-                Some(kind @ (TaskKind::Daily | TaskKind::Copilot)) => {
-                    match localize_task_log(&text, kind) {
-                        std::borrow::Cow::Borrowed(_) => text,
-                        std::borrow::Cow::Owned(localized) => localized,
-                    }
-                }
+                Some(kind) => match localize_task_log(&text, kind) {
+                    std::borrow::Cow::Borrowed(_) => text,
+                    std::borrow::Cow::Owned(localized) => localized,
+                },
                 _ => text,
             }
         } else {

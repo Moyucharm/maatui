@@ -1015,53 +1015,106 @@ fn localizes_only_known_active_task_messages() {
 }
 
 #[test]
-fn localizes_daily_progress_and_summary_events() {
-    let mut app = App::new();
-    app.phase = TaskPhase::Running;
-    app.active_task_kind = Some(TaskKind::Daily);
-    app.active_log_scope = LogScope::Daily;
-    for message in [
-        "[2026-09-06 22:00:00 INFO] Current sanity: 100",
-        "[2026-09-06 22:00:00 INFO] Drops: 3",
-        "[2026-09-06 22:00:00 INFO] RecruitResult: 5",
-        "[2026-09-06 22:00:00 INFO] EnterFacility Trade",
-        "[2026-09-06 22:00:00 INFO] NotEnoughStaff",
-        "[2026-09-06 22:00:00 INFO] AllTasksCompleted",
-        "[2026-09-06 22:00:00 INFO] Connected",
-        "[2026-09-06 22:00:00 INFO] Mission started",
-        "[2026-09-06 22:00:00 ERROR] FailedToStartGame",
-        "[2026-09-06 22:00:00 ERROR] Some error occurred during running task!",
-        // 截图中的 maa-cli 填充前缀格式与热更新回调正文。
-        "[2026-09-27 14:16:56 INFO ] Updating hot update files...",
-        "[2026-09-27 14:16:57 INFO ] Hot update completed successfully",
-        "[2026-09-27 14:16:58 INFO ] Connected",
+fn log_localization_respects_active_scope_and_phase_for_all_task_kinds() {
+    for (kind, scope, message, localized) in [
+        (
+            TaskKind::Daily,
+            LogScope::Daily,
+            "ReconnectSuccess",
+            "重连成功",
+        ),
+        (
+            TaskKind::Copilot,
+            LogScope::Copilot,
+            "ReconnectSuccess",
+            "重连成功",
+        ),
+        (
+            TaskKind::Roguelike,
+            LogScope::Roguelike,
+            "Roguelike Start",
+            "自动肉鸽 开始",
+        ),
+        (
+            TaskKind::Update,
+            LogScope::Update,
+            "Fetching resource repository...",
+            "正在拉取资源仓库…",
+        ),
     ] {
-        app.push_log_to(LogScope::Daily, LogLevel::Info, message);
+        let mut app = App::new();
+        app.active_task_kind = Some(kind);
+        app.active_log_scope = scope;
+        for phase in [TaskPhase::Running, TaskPhase::Stopping] {
+            app.phase = phase;
+            app.push_log_to(scope, LogLevel::Warn, message);
+            let line = app.log_buffer(scope).lines.back().unwrap();
+            assert_eq!(line.text, localized);
+            assert_eq!(line.level, LogLevel::Warn);
+
+            let other_scope = if scope == LogScope::Daily {
+                LogScope::Update
+            } else {
+                LogScope::Daily
+            };
+            app.push_log_to(other_scope, LogLevel::Warn, message);
+            assert_eq!(
+                app.log_buffer(other_scope).lines.back().unwrap().text,
+                message
+            );
+        }
+        app.phase = TaskPhase::Idle;
+        app.push_log_to(scope, LogLevel::Info, message);
+        assert_eq!(app.log_buffer(scope).lines.back().unwrap().text, message);
     }
-    let texts: Vec<&str> = app
-        .log_buffer(LogScope::Daily)
-        .lines
-        .iter()
-        .map(|line| line.text.as_str())
-        .collect();
-    assert_eq!(
-        texts,
-        [
-            "[2026-09-06 22:00:00 INFO] 当前理智：100",
-            "[2026-09-06 22:00:00 INFO] 掉落：3",
-            "[2026-09-06 22:00:00 INFO] 招募结果：5",
-            "[2026-09-06 22:00:00 INFO] 进入设施 Trade",
-            "[2026-09-06 22:00:00 INFO] 可用干员不足",
-            "[2026-09-06 22:00:00 INFO] 所有任务已结束",
-            "[2026-09-06 22:00:00 INFO] 已连接",
-            "[2026-09-06 22:00:00 INFO] 作战已开始",
-            "[2026-09-06 22:00:00 ERROR] 启动游戏失败",
-            "[2026-09-06 22:00:00 ERROR] 任务运行过程中发生错误！",
-            "[2026-09-27 14:16:56 INFO ] 正在更新热更新资源…",
-            "[2026-09-27 14:16:57 INFO ] 热更新成功",
-            "[2026-09-27 14:16:58 INFO ] 已连接",
-        ]
-    );
+}
+
+#[test]
+fn log_localization_preserves_template_parameters_and_unknown_diagnostics() {
+    let prefix = "[2026-10-11 16:30:00 INFO ] ";
+    for (message, expected) in [
+        (
+            "Mission started (6 times, use 108 sanity)",
+            "作战已开始（连战 6 次，消耗 108 理智）",
+        ),
+        ("Use 2 expiring medicine", "使用 2 瓶即将过期的理智药"),
+        (
+            "Deposit 3 / 17 / 42 originium ingots",
+            "投资源石锭：本次 3 / 累计 17 / 存款 42",
+        ),
+        ("EnterFacility Trade #0", "进入设施 贸易站 #0"),
+        (
+            "EnterFacility FutureFacility #2",
+            "进入设施 FutureFacility #2",
+        ),
+        ("StartCombat 未来关卡 TO-3", "开始作战：未来关卡 TO-3"),
+        ("Drops: 固源岩 × 2, none × 1", "掉落：固源岩 × 2, none × 1"),
+    ] {
+        let raw = format!("{prefix}{message}");
+        assert_eq!(
+            localize_task_log(&raw, TaskKind::Roguelike),
+            format!("{prefix}{expected}")
+        );
+    }
+    for message in [
+        "Use two medicine",
+        "Use 2 medicine extra diagnostic",
+        "Use 2 stones: failed",
+        "Mission started (6 times, use invalid sanity)",
+        "Deposit 3 / 17 / 42 / 9 originium ingots",
+        "Start exploration -1 times",
+        "RecruitTagsRefreshed: 2 times: failed",
+        "StartCombatant unknown",
+        "Connected but unverified",
+        "StartCombat Tile-POS diagnostic",
+        "unknown diagnostic payload",
+    ] {
+        let raw = format!("{prefix}{message}");
+        assert!(matches!(
+            localize_task_log(&raw, TaskKind::Roguelike),
+            std::borrow::Cow::Borrowed(original) if original == raw
+        ));
+    }
 }
 
 fn test_config_with_disabled_tasks() -> (PathBuf, DailyConfig) {

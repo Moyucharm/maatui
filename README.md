@@ -220,7 +220,16 @@ MaaTUI 强制使用 `MAA_LOG_PREFIX=Always` 获取可解析的日志等级，并
 
 日志颜色使用固定 RGB，避免终端主题把 ANSI 青色重映射成黄色；同时不会再把 maa-cli 写入 `stderr` 的所有普通日志一律显示成黄色 `!`。
 
-运行每日任务与自动战斗时，MaaTUI 会把 maa-cli 的已知运行事件显示为中文，例如 `Fight Error` → `刷理智 执行失败`、`AllTasksCompleted` → `所有任务已结束`、`BattleFormationSelected 斑点` → `已选干员：斑点`。翻译只按完整消息或精确前缀匹配，并且只作用于当前运行的任务日志；Tile-Pos 等诊断文本和无法识别的行保持原文，避免误译或掩盖错误。
+运行每日任务、自动战斗、自动肉鸽和更新任务时，MaaTUI 会把 maa-cli 的已知运行事件显示为中文，覆盖连接与重连、理智与掉落、招募、基建设施、肉鸽探索与投资、资源更新及常见启动提示。例如：
+
+- `Fight Error` → `刷理智 执行失败`
+- `Mission started (6 times, use 108 sanity)` → `作战已开始（连战 6 次，消耗 108 理智）`
+- `EnterFacility Trade #0` → `进入设施 贸易站 #0`
+- `BattleFormationSelected 斑点` → `已选干员：斑点`
+- `Start exploration 2 times` → `开始第 2 次探索`
+- `Fetching resource repository...` → `正在拉取资源仓库…`
+
+翻译按完整消息、精确前缀或已知参数模板匹配；数字模板必须完整匹配并含有效数字，不会翻译夹带额外诊断的相似消息。只处理当前运行或正在停止的任务日志，不影响其他页面与空闲时的日志。时间戳、等级、关卡码、干员名与未知设施名保持原样；Tile-Pos 等诊断文本和无法识别的行保持原文，避免误译或掩盖错误。
 
 ## 前置条件
 

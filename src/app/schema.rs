@@ -457,21 +457,30 @@ fn recruit_star_options() -> Vec<SelectOption> {
         .collect()
 }
 
+const FACILITY_LABELS: [(&str, &str); 9] = [
+    ("Mfg", "制造站"),
+    ("Trade", "贸易站"),
+    ("Control", "控制中枢"),
+    ("Power", "发电站"),
+    ("Reception", "会客室"),
+    ("Office", "办公室"),
+    ("Dorm", "宿舍"),
+    ("Processing", "加工站"),
+    ("Training", "训练室"),
+];
+
+pub(super) fn facility_label(value: &str) -> &str {
+    FACILITY_LABELS
+        .iter()
+        .find_map(|&(name, label)| (name == value).then_some(label))
+        .unwrap_or(value)
+}
+
 fn facility_options() -> Vec<SelectOption> {
-    [
-        ("Mfg", "制造站", "Mfg"),
-        ("Trade", "贸易站", "Trade"),
-        ("Control", "控制中枢", "Control"),
-        ("Power", "发电站", "Power"),
-        ("Reception", "会客室", "Reception"),
-        ("Office", "办公室", "Office"),
-        ("Dorm", "宿舍", "Dorm"),
-        ("Processing", "加工站", "Processing"),
-        ("Training", "训练室", "Training"),
-    ]
-    .into_iter()
-    .map(|(value, label, description)| option(string(value), label, description))
-    .collect()
+    FACILITY_LABELS
+        .into_iter()
+        .map(|(value, label)| option(string(value), label, value))
+        .collect()
 }
 
 pub(super) fn copilot_formation_options() -> Vec<SelectOption> {
@@ -671,6 +680,7 @@ pub(super) fn task_type_label(task_type: &str) -> &str {
         "Award" => "领取奖励",
         "CloseDown" => "关闭游戏",
         "Copilot" => "自动战斗",
+        "Roguelike" => "自动肉鸽",
         _ => task_type,
     }
 }

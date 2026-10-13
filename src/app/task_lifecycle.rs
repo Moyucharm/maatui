@@ -648,6 +648,11 @@ impl App {
         taskchain: &str,
         error: Option<String>,
     ) {
+        // 用户停止期间的残留回调不再告警；内部错误导致的停止仍保留失败诊断。
+        if self.phase == TaskPhase::Stopping && self.task_abort_error.is_none() {
+            self.clear_pending_core_failure(task_id, taskchain);
+            return;
+        }
         let reason = if self
             .pending_core_failure
             .as_ref()
@@ -796,10 +801,13 @@ impl App {
         let check_resource = self.pending_resource_check;
         let version_before = self.resource_version_before.take();
         self.pending_resource_check = false;
+        // UI 终态与作业集成功补记共用退出判定，核心失败不能被 exit 0 掩盖。
+        let successful_exit =
+            !stopped && code == Some(0) && task_abort_error.is_none() && core_failure.is_none();
         let mut batch_state_error = None;
         let mut batch_abort_error = None;
         if let Some(batch) = self.copilot_batch.take() {
-            let exit = batch.finish(code, stopped);
+            let exit = batch.finish(successful_exit);
             batch_abort_error = exit.abort_error;
             if !exit.reconcile_indices.is_empty() {
                 let result = self
@@ -832,11 +840,7 @@ impl App {
             && daily_completed
             && matches!(code, Some(0 | 1))
             && no_internal_error;
-        let completed = !stopped
-            && code == Some(0)
-            && no_internal_error
-            && !daily_failed
-            && core_failure.is_none();
+        let completed = successful_exit && no_internal_error && !daily_failed;
         let failure_detail = task_abort_error
             .clone()
             .or_else(|| batch_abort_error.clone())

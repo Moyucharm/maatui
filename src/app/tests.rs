@@ -2027,6 +2027,55 @@ fn batch_failure_keeps_failed_and_remaining_entries_enabled() {
 }
 
 #[test]
+fn batch_zero_exit_preserves_pending_entries_after_core_or_internal_failure() {
+    for failure in ["core", "task", "batch"] {
+        let (dir, cache) = test_copilot_cache(3);
+        let task_path = dir.join("batch.json");
+        fs::write(&task_path, "{}").unwrap();
+        let mut app = App::new();
+        app.notification_worker = None;
+        app.phase = TaskPhase::Running;
+        app.active_task_kind = Some(TaskKind::Copilot);
+        app.active_label = "作业集自动战斗".to_string();
+        app.active_log_scope = LogScope::Copilot;
+        app.copilot_cache = Some(cache);
+        app.copilot_batch = Some(CopilotBatchState::new(task_path.clone(), vec![0, 1, 2]));
+        app.on_copilot_stage_succeeded();
+        match failure {
+            "core" => app.on_task_chain_failed(1, "Copilot", Some("自动编队失败".into())),
+            "task" => app.abort_running_task("进度监视失败".into()),
+            "batch" => app
+                .copilot_batch
+                .as_mut()
+                .unwrap()
+                .set_abort_error("进度监视失败".into()),
+            _ => unreachable!(),
+        }
+
+        app.on_exited(Some(0), false);
+
+        assert_eq!(app.status_text, "失败 · exit 0", "{failure}");
+        assert!(app.last_failed, "{failure}");
+        assert_eq!(
+            app.copilot_cache.as_ref().unwrap().enabled_indices(),
+            vec![1, 2],
+            "{failure}"
+        );
+        let reloaded = CopilotCache::load(dir.join("copilot-set.json"), dir.join("files")).unwrap();
+        assert_eq!(reloaded.enabled_indices(), vec![1, 2], "{failure}");
+        assert!(
+            !app.log_buffer(LogScope::Copilot)
+                .lines
+                .iter()
+                .any(|line| line.text.contains("批次整体成功")),
+            "{failure}"
+        );
+        assert!(!task_path.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
 fn batch_success_reconciles_missed_progress_events() {
     let (dir, cache) = test_copilot_cache(3);
     let task_path = dir.join("batch.json");
@@ -2785,7 +2834,90 @@ fn daily_retry_clue_without_chain_error_is_not_a_failure() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-/// 同一任务链重复失败只提醒一次，并忽略手动停止后的残留错误。
+/// 用户停止丢弃晚到的失败回调，内部中止仍保留诊断与失败通知。
+#[test]
+fn stopping_ignores_late_chain_errors_only_for_manual_stops() {
+    for kind in [TaskKind::Daily, TaskKind::Copilot] {
+        for internal_abort in [false, true] {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!("maatui-stopping-{unique}"));
+            fs::create_dir_all(&dir).unwrap();
+            let record = dir.join("record.txt");
+            let (scope, chain, label) = if kind == TaskKind::Daily {
+                (LogScope::Daily, "Fight", "每日任务")
+            } else {
+                (LogScope::Copilot, "Copilot", "自动战斗")
+            };
+            let mut app = App::new();
+            app.phase = TaskPhase::Stopping;
+            app.active_task_kind = Some(kind);
+            app.active_label = label.into();
+            app.active_log_scope = scope;
+            app.notification_worker = Some(recording_notification_worker(&dir, &record));
+            if kind == TaskKind::Daily {
+                app.daily_run = Some(DailyRunState {
+                    tasks: vec![TaskSummary {
+                        name: "刷理智".into(),
+                        task_type: chain.into(),
+                        enabled: true,
+                    }],
+                    total: 1,
+                    failed: Vec::new(),
+                    completed: false,
+                });
+            }
+            if internal_abort {
+                app.abort_running_task("进度监视失败".into());
+            }
+            app.pending_core_failure = Some((1, chain.into(), "停止期间失败线索".into()));
+
+            app.on_task_chain_failed(1, chain, None);
+
+            assert!(app.pending_core_failure.is_none());
+            if kind == TaskKind::Daily {
+                assert_eq!(
+                    app.daily_run.as_ref().unwrap().failed.len(),
+                    usize::from(internal_abort)
+                );
+            } else {
+                assert_eq!(app.copilot_core_failure.is_some(), internal_abort);
+            }
+            app.on_exited(None, true);
+            app.notification_worker.as_mut().unwrap().shutdown();
+            let recorded = recorded_notifications(&record);
+            if internal_abort {
+                assert!(app.last_failed);
+                assert_eq!(app.status_text, "失败 · exit ?");
+                assert_eq!(
+                    recorded.len(),
+                    if kind == TaskKind::Daily { 2 } else { 1 },
+                    "{recorded:?}"
+                );
+                assert!(
+                    recorded.last().unwrap().contains("进度监视失败"),
+                    "{recorded:?}"
+                );
+            } else {
+                assert!(!app.last_failed);
+                assert_eq!(app.status_text, "已停止 · exit ?");
+                assert!(recorded.is_empty(), "{recorded:?}");
+                assert!(
+                    !app.log_buffer(scope)
+                        .lines
+                        .iter()
+                        .any(|line| line.text.contains("执行失败"))
+                );
+            }
+            app.cleanup();
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+}
+
+/// 同一任务链重复失败只提醒一次，手动停止不追加终态通知。
 #[test]
 fn repeated_chain_error_notifies_once_and_manual_stop_ignores_it() {
     let unique = SystemTime::now()

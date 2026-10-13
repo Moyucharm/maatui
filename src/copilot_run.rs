@@ -81,8 +81,9 @@ impl CopilotBatchState {
         &self.task_path
     }
 
-    pub fn finish(self, code: Option<i32>, stopped: bool) -> BatchExit {
-        let reconcile_indices = if !stopped && code == Some(0) {
+    /// 调用方汇总进程退出与核心诊断；内部中止也不能补记剩余项成功。
+    pub fn finish(self, successful_exit: bool) -> BatchExit {
+        let reconcile_indices = if successful_exit && self.abort_error.is_none() {
             self.indices[self.completed.min(self.indices.len())..].to_vec()
         } else {
             Vec::new()
@@ -130,11 +131,14 @@ mod tests {
     fn reconciles_only_clean_successful_exit() {
         let mut state = CopilotBatchState::new("batch.json".into(), vec![1, 2, 3]);
         state.mark_success();
-        assert_eq!(state.finish(Some(0), false).reconcile_indices, vec![2, 3]);
+        assert_eq!(state.finish(true).reconcile_indices, vec![2, 3]);
 
         let state = CopilotBatchState::new("batch.json".into(), vec![1, 2]);
-        assert!(state.finish(Some(1), false).reconcile_indices.is_empty());
-        let state = CopilotBatchState::new("batch.json".into(), vec![1, 2]);
-        assert!(state.finish(None, true).reconcile_indices.is_empty());
+        assert!(state.finish(false).reconcile_indices.is_empty());
+        let mut state = CopilotBatchState::new("batch.json".into(), vec![1, 2]);
+        state.set_abort_error("进度监视失败".to_string());
+        let exit = state.finish(true);
+        assert!(exit.reconcile_indices.is_empty());
+        assert_eq!(exit.abort_error.as_deref(), Some("进度监视失败"));
     }
 }

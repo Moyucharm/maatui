@@ -30,6 +30,18 @@ impl ConnectionField {
         }
     }
 
+    fn alias(self) -> Option<&'static str> {
+        match self {
+            Self::Address => Some("device"),
+            Self::Preset => Some("type"),
+            Self::AdbPath | Self::Config => None,
+        }
+    }
+
+    fn keys(self) -> impl Iterator<Item = &'static str> {
+        std::iter::once(self.key()).chain(self.alias())
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::AdbPath => "ADB 路径",
@@ -113,20 +125,20 @@ impl ConnectionConfig {
     }
 
     pub fn value(&self, field: ConnectionField) -> Option<&str> {
-        match &self.document {
+        field.keys().find_map(|key| match &self.document {
             ConnectionDocument::Toml(document) => document
                 .get("connection")?
                 .as_table_like()?
-                .get(field.key())?
+                .get(key)?
                 .as_str(),
             ConnectionDocument::Yaml(root) => root
                 .as_mapping()?
                 .get(YamlValue::String("connection".into()))?
                 .as_mapping()?
-                .get(YamlValue::String(field.key().into()))?
+                .get(YamlValue::String(key.into()))?
                 .as_str(),
-            ConnectionDocument::Json(root) => root.get("connection")?.get(field.key())?.as_str(),
-        }
+            ConnectionDocument::Json(root) => root.get("connection")?.get(key)?.as_str(),
+        })
     }
 
     pub fn set_field(&mut self, field: ConnectionField, input: &str) -> Result<()> {
@@ -143,16 +155,22 @@ impl ConnectionConfig {
                         .as_table_like_mut()
                         .context("connection 不是对象")?;
                     if input.is_empty() {
-                        connection.remove(field.key());
+                        for key in field.keys() {
+                            connection.remove(key);
+                        }
                     } else {
+                        // 保留已有字段名（包括旧别名），避免引入 maa-cli 拒绝的重复字段。
+                        let key = field
+                            .keys()
+                            .find(|key| connection.contains_key(key))
+                            .unwrap_or(field.key());
                         let mut replacement = value(input);
                         // 替换已有值时保留其空白与行尾注释，包括 inline table。
-                        if let Some(previous) = connection.get(field.key()).and_then(Item::as_value)
-                        {
+                        if let Some(previous) = connection.get(key).and_then(Item::as_value) {
                             *replacement.as_value_mut().unwrap().decor_mut() =
                                 previous.decor().clone();
                         }
-                        connection.insert(field.key(), replacement);
+                        connection.insert(key, replacement);
                     }
                 }
             }
@@ -166,11 +184,19 @@ impl ConnectionConfig {
                 }
                 if let Some(connection) = root.get_mut(&section) {
                     let connection = connection.as_mapping_mut().context("connection 不是对象")?;
-                    let key = YamlValue::String(field.key().into());
                     if input.is_empty() {
-                        connection.remove(&key);
+                        for key in field.keys() {
+                            connection.remove(YamlValue::String(key.into()));
+                        }
                     } else {
-                        connection.insert(key, YamlValue::String(input.into()));
+                        let key = field
+                            .keys()
+                            .find(|key| connection.contains_key(YamlValue::String((*key).into())))
+                            .unwrap_or(field.key());
+                        connection.insert(
+                            YamlValue::String(key.into()),
+                            YamlValue::String(input.into()),
+                        );
                     }
                 }
             }
@@ -184,9 +210,15 @@ impl ConnectionConfig {
                 if let Some(connection) = root.get_mut("connection") {
                     let connection = connection.as_object_mut().context("connection 不是对象")?;
                     if input.is_empty() {
-                        connection.remove(field.key());
+                        for key in field.keys() {
+                            connection.remove(key);
+                        }
                     } else {
-                        connection.insert(field.key().into(), JsonValue::String(input.into()));
+                        let key = field
+                            .keys()
+                            .find(|key| connection.contains_key(*key))
+                            .unwrap_or(field.key());
+                        connection.insert(key.into(), JsonValue::String(input.into()));
                     }
                 }
             }
@@ -208,44 +240,53 @@ impl ConnectionConfig {
             ConnectionDocument::Toml(document) => {
                 if let Some(connection) = document.get("connection") {
                     let connection = connection.as_table_like().context("connection 不是对象")?;
-                    for field in ConnectionField::ALL {
-                        if let Some(value) = connection.get(field.key()) {
-                            if value.as_str().is_none() {
-                                bail!("connection.{} 必须是字符串", field.key());
-                            }
-                        }
-                    }
+                    validate_connection_fields(|key| {
+                        connection.get(key).map(|value| value.as_str().is_some())
+                    })?;
                 }
             }
             ConnectionDocument::Yaml(root) => {
                 let root = root.as_mapping().context("默认 profile 根节点不是对象")?;
                 if let Some(connection) = root.get(YamlValue::String("connection".into())) {
                     let connection = connection.as_mapping().context("connection 不是对象")?;
-                    for field in ConnectionField::ALL {
-                        if let Some(value) = connection.get(YamlValue::String(field.key().into())) {
-                            if value.as_str().is_none() {
-                                bail!("connection.{} 必须是字符串", field.key());
-                            }
-                        }
-                    }
+                    validate_connection_fields(|key| {
+                        connection
+                            .get(YamlValue::String(key.into()))
+                            .map(|value| value.as_str().is_some())
+                    })?;
                 }
             }
             ConnectionDocument::Json(root) => {
                 let root = root.as_object().context("默认 profile 根节点不是对象")?;
                 if let Some(connection) = root.get("connection") {
                     let connection = connection.as_object().context("connection 不是对象")?;
-                    for field in ConnectionField::ALL {
-                        if let Some(value) = connection.get(field.key()) {
-                            if !value.is_string() {
-                                bail!("connection.{} 必须是字符串", field.key());
-                            }
-                        }
-                    }
+                    validate_connection_fields(|key| {
+                        connection.get(key).map(JsonValue::is_string)
+                    })?;
                 }
             }
         }
         Ok(())
     }
+}
+
+/// 三种文档格式共用字段及别名校验，拒绝 maa-cli 无法反序列化的重复表示。
+fn validate_connection_fields(is_string: impl Fn(&str) -> Option<bool>) -> Result<()> {
+    for field in ConnectionField::ALL {
+        let mut previous = None;
+        for key in field.keys() {
+            if let Some(is_string) = is_string(key) {
+                if let Some(previous) = previous {
+                    bail!("connection.{previous} 与 connection.{key} 重复，请只保留一个");
+                }
+                if !is_string {
+                    bail!("connection.{key} 必须是字符串");
+                }
+                previous = Some(key);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn profile_matches(directory: &Path, basename: &str) -> Result<Vec<PathBuf>> {
@@ -401,6 +442,148 @@ mod tests {
         let document: DocumentMut = saved.parse().unwrap();
         assert!(document["connection"].as_inline_table().is_some());
         assert_eq!(document["connection"]["future"].as_integer(), Some(42));
+    }
+
+    #[derive(serde::Deserialize)]
+    struct MaaConnection {
+        #[serde(default, alias = "device")]
+        address: Option<String>,
+        #[serde(default, alias = "type")]
+        preset: Option<String>,
+    }
+
+    fn parse_maa_connection(extension: &str, raw: &str) -> MaaConnection {
+        let connection = match extension {
+            "toml" => {
+                let document: DocumentMut = raw.parse().unwrap();
+                JsonValue::Object(
+                    document["connection"]
+                        .as_table_like()
+                        .unwrap()
+                        .iter()
+                        .map(|(key, value)| {
+                            (
+                                key.to_string(),
+                                JsonValue::String(value.as_str().unwrap().into()),
+                            )
+                        })
+                        .collect(),
+                )
+            }
+            "json" => serde_json::from_str::<JsonValue>(raw).unwrap()["connection"].clone(),
+            _ => serde_yaml::from_str::<JsonValue>(raw).unwrap()["connection"].clone(),
+        };
+        // 与 maa-cli 相同的 serde 别名规则也会拒绝标准字段与别名同时存在。
+        serde_json::from_value(connection).unwrap()
+    }
+
+    #[test]
+    fn legacy_aliases_are_loaded_edited_and_cleared_across_formats() {
+        for (extension, raw) in [
+            (
+                "toml",
+                "[connection]\ndevice = 'old-device' # device comment\ntype = 'ADB' # type comment\nfuture = 'kept'\n",
+            ),
+            (
+                "toml",
+                "connection = { device = 'old-device', type = 'ADB', future = 'kept' } # inline\n",
+            ),
+            (
+                "yaml",
+                "connection: {device: old-device, type: ADB, future: kept}\n",
+            ),
+            (
+                "yml",
+                "connection: {device: old-device, type: ADB, future: kept}\n",
+            ),
+            (
+                "json",
+                r#"{"connection":{"device":"old-device","type":"ADB","future":"kept"}}"#,
+            ),
+        ] {
+            let dir = TempDir::new();
+            let path = dir.profile(extension, raw);
+            let mut config = ConnectionConfig::load_from_config_dir(&dir.0).unwrap();
+            assert_eq!(config.value(ConnectionField::Address), Some("old-device"));
+            assert_eq!(config.value(ConnectionField::Preset), Some("ADB"));
+            assert_eq!(fs::read_to_string(&path).unwrap(), raw, "加载不能迁移字段");
+
+            config
+                .set_field(ConnectionField::Address, "new-device")
+                .unwrap();
+            config
+                .set_field(ConnectionField::Preset, "Waydroid")
+                .unwrap();
+            let saved = fs::read_to_string(&path).unwrap();
+            let parsed = parse_maa_connection(extension, &saved);
+            assert_eq!(parsed.address.as_deref(), Some("new-device"));
+            assert_eq!(parsed.preset.as_deref(), Some("Waydroid"));
+            assert!(
+                !saved.contains("address") && !saved.contains("preset"),
+                "{saved}"
+            );
+            assert!(saved.contains("kept"), "{saved}");
+            if raw.contains("# device comment") {
+                assert!(saved.contains("# device comment") && saved.contains("# type comment"));
+            }
+            if raw.contains("# inline") {
+                assert!(saved.contains("# inline"));
+            }
+            let reloaded = ConnectionConfig::load_from_config_dir(&dir.0).unwrap();
+            assert_eq!(reloaded.value(ConnectionField::Address), Some("new-device"));
+            assert_eq!(reloaded.value(ConnectionField::Preset), Some("Waydroid"));
+
+            config.set_field(ConnectionField::Address, " ").unwrap();
+            config.set_field(ConnectionField::Preset, "").unwrap();
+            let saved = fs::read_to_string(&path).unwrap();
+            let parsed = parse_maa_connection(extension, &saved);
+            assert!(
+                parsed.address.is_none() && parsed.preset.is_none(),
+                "{saved}"
+            );
+            assert!(
+                !saved.contains("device") && !saved.contains("type"),
+                "{saved}"
+            );
+            assert!(saved.contains("kept"), "{saved}");
+            let reloaded = ConnectionConfig::load_from_config_dir(&dir.0).unwrap();
+            assert_eq!(reloaded.value(ConnectionField::Address), None);
+            assert_eq!(reloaded.value(ConnectionField::Preset), None);
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_aliases_and_duplicate_fields_without_writing() {
+        for extension in ["toml", "yaml", "yml", "json"] {
+            for (alias, key) in [("device", "address"), ("type", "preset")] {
+                for duplicate in [false, true] {
+                    let raw = match (extension, duplicate) {
+                        ("toml", false) => format!("[connection]\n{alias} = 42\n"),
+                        ("toml", true) => format!("[connection]\n{alias} = 'old'\n{key} = 'new'\n"),
+                        ("json", false) => format!(r#"{{"connection":{{"{alias}":42}}}}"#),
+                        ("json", true) => {
+                            format!(r#"{{"connection":{{"{alias}":"old","{key}":"new"}}}}"#)
+                        }
+                        (_, false) => format!("connection: {{{alias}: 42}}\n"),
+                        (_, true) => format!("connection: {{{alias}: old, {key}: new}}\n"),
+                    };
+                    let dir = TempDir::new();
+                    let path = dir.profile(extension, &raw);
+                    let error = ConnectionConfig::load_from_config_dir(&dir.0).unwrap_err();
+                    let message = format!("{error:#}");
+                    assert!(message.contains(alias), "{message}");
+                    assert!(
+                        message.contains(if duplicate {
+                            "重复"
+                        } else {
+                            "必须是字符串"
+                        }),
+                        "{message}"
+                    );
+                    assert_eq!(fs::read_to_string(path).unwrap(), raw);
+                }
+            }
+        }
     }
 
     #[test]
